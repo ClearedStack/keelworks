@@ -1,0 +1,25 @@
+{
+  "slug": "keelworks",
+  "name": "Keelworks",
+  "formerly": "cs-runner",
+  "earlierNames": [
+    "Slipway"
+  ],
+  "kind": "control-plane",
+  "namespace": "clearedstack",
+  "responsibility": "Tests, builds and signs an image for every change.",
+  "interfaces": [
+    "Receives push notifications from Plainforge",
+    "Pushes signed images to Lazarette",
+    "Writes the new image digest back to Plainforge"
+  ],
+  "repository": "keelworks",
+  "image": "keelworks",
+  "dependsOn": [
+    "plainforge",
+    "lazarette"
+  ],
+  "memory": "32 MiB",
+  "version": "v0.1.0-draft",
+  "subTools": []
+}
