@@ -1,0 +1,9 @@
+{
+  "outcomes": [
+    {"repository": "muster", "commit": "1111111111111111111111111111111111111111", "outcome": "pass"},
+    {"repository": "muster", "commit": "2222222222222222222222222222222222222222", "outcome": "fail"},
+    {"repository": "lazarette", "commit": "3333333333333333333333333333333333333333", "outcome": "pass"},
+    {"repository": "shipkeeper", "commit": "4444444444444444444444444444444444444444", "outcome": "stall"},
+    {"repository": "plainforge", "commit": "5555555555555555555555555555555555555555", "outcome": "preempt"}
+  ]
+}

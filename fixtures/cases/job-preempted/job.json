@@ -1,0 +1,69 @@
+{
+  "apiVersion": "batch/v1",
+  "kind": "Job",
+  "metadata": {
+    "name": "keelworks-test-plainforge-189ae711af8a",
+    "namespace": "clearedstack",
+    "labels": {
+      "app.kubernetes.io/component": "test",
+      "app.kubernetes.io/instance": "plainforge-189ae711af8a",
+      "app.kubernetes.io/managed-by": "keelworks",
+      "app.kubernetes.io/part-of": "plainforge"
+    }
+  },
+  "spec": {
+    "activeDeadlineSeconds": 600,
+    "backoffLimit": 0,
+    "template": {
+      "metadata": {
+        "labels": {
+          "app.kubernetes.io/component": "test",
+          "app.kubernetes.io/instance": "plainforge-189ae711af8a",
+          "app.kubernetes.io/managed-by": "keelworks",
+          "app.kubernetes.io/part-of": "plainforge"
+        }
+      },
+      "spec": {
+        "automountServiceAccountToken": false,
+        "containers": [
+          {
+            "name": "test",
+            "image": "lazarette.clearedstack.svc.cluster.local:5000/made-up-test-image",
+            "env": [
+              {
+                "name": "KEELWORKS_REPOSITORY",
+                "value": "plainforge"
+              },
+              {
+                "name": "KEELWORKS_REF",
+                "value": "refs/heads/main"
+              },
+              {
+                "name": "KEELWORKS_COMMIT",
+                "value": "5555555555555555555555555555555555555555"
+              }
+            ],
+            "securityContext": {
+              "allowPrivilegeEscalation": false,
+              "capabilities": {
+                "drop": [
+                  "ALL"
+                ]
+              },
+              "privileged": false,
+              "runAsNonRoot": true
+            }
+          }
+        ],
+        "priorityClassName": "made-up-low-priority",
+        "restartPolicy": "Never",
+        "securityContext": {
+          "runAsNonRoot": true,
+          "seccompProfile": {
+            "type": "RuntimeDefault"
+          }
+        }
+      }
+    }
+  }
+}
