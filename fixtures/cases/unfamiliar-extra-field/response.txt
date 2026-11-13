@@ -1,0 +1,3 @@
+HTTP 422
+
+{"status":"refused","code":"E_NEEDS_SUBTOOL","detail":"notification has a field no rule covers"}
