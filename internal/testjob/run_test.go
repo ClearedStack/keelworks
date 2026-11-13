@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/clearedstack/keelworks/internal/fault"
+	"github.com/ClearedStack/keelworks/internal/fault"
 )
 
 type fakeCluster struct {

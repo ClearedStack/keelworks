@@ -1,1 +1,1 @@
-{"repository":"muster","ref":"refs/heads/main","commit":1111,"message":"Commit is a number"}
+{"repository":"muster","ref":"refs/heads/main","before":"abababababababababababababababababababab","after":1111}

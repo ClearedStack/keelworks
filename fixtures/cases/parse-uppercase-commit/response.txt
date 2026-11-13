@@ -1,3 +1,0 @@
-HTTP 400
-
-{"status":"refused","code":"E_PARSE","detail":"field commit is malformed"}

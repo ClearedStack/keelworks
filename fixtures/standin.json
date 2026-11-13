@@ -5,5 +5,13 @@
     {"repository": "lazarette", "commit": "3333333333333333333333333333333333333333", "outcome": "pass"},
     {"repository": "shipkeeper", "commit": "4444444444444444444444444444444444444444", "outcome": "stall"},
     {"repository": "plainforge", "commit": "5555555555555555555555555555555555555555", "outcome": "preempt"}
+  ],
+  "callers": [
+    {"token": "made-up-token-of-plainforge", "username": "system:serviceaccount:clearedstack:plainforge", "audiences": ["keelworks"]},
+    {"token": "made-up-token-for-another-audience", "username": "system:serviceaccount:clearedstack:plainforge", "audiences": ["made-up-other-audience"]},
+    {"token": "made-up-token-of-muster", "username": "system:serviceaccount:clearedstack:muster", "audiences": ["keelworks"]},
+    {"token": "made-up-token-of-a-namesake", "username": "system:serviceaccount:cs-workers:plainforge", "audiences": ["keelworks"]},
+    {"token": "made-up-token-the-check-stalls-on", "review": "stall"},
+    {"token": "made-up-token-the-check-fails-on", "review": "unavailable"}
   ]
 }

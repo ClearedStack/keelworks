@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/clearedstack/keelworks/internal/testjob"
+	"github.com/ClearedStack/keelworks/internal/testjob"
 )
 
 // Scripted outcomes. The stand-in runs no tests; it plays back what the
@@ -22,11 +22,13 @@ const (
 	OutcomePreempt = "preempt" // evicted under memory pressure
 )
 
-// Script says how the tests of each commit end. A commit that is not in the
-// script has no Job outcome: the stand-in loses the Job rather than invent
-// one.
+// Script says how the tests of each commit end and which bearer tokens the
+// cluster knows. A commit that is not in the script has no Job outcome: the
+// stand-in loses the Job rather than invent one. A token that is not in the
+// script is one the cluster does not vouch for.
 type Script struct {
 	Outcomes []ScriptedOutcome `json:"outcomes"`
+	Callers  []ScriptedCaller  `json:"callers"`
 }
 
 // ScriptedOutcome is one line of a Script.
@@ -48,6 +50,18 @@ func ParseScript(data []byte) (Script, error) {
 		default:
 			return Script{}, fmt.Errorf("stand-in script line %d has an unknown outcome", i+1)
 		}
+	}
+	seen := map[string]bool{}
+	for i, c := range s.Callers {
+		switch {
+		case c.Token == "":
+			return Script{}, fmt.Errorf("stand-in script caller %d has no token", i+1)
+		case seen[c.Token]:
+			return Script{}, fmt.Errorf("stand-in script caller %d repeats a token", i+1)
+		case c.Review != "" && c.Review != ReviewStall && c.Review != ReviewUnavailable:
+			return Script{}, fmt.Errorf("stand-in script caller %d has an unknown review", i+1)
+		}
+		seen[c.Token] = true
 	}
 	return s, nil
 }

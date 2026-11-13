@@ -1,3 +1,3 @@
-module github.com/clearedstack/keelworks
+module github.com/ClearedStack/keelworks
 
 go 1.24

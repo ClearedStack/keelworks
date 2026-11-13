@@ -1,6 +1,6 @@
 // Package controller is Keelworks' HTTP surface and its table of runs: it
-// takes push notifications in, starts a test Job for each one that must be
-// tested, and reports how each run ended.
+// takes push notifications in from Plainforge and from nobody else, starts a
+// test Job for each one that must be tested, and reports how each run ended.
 package controller
 
 import (
@@ -13,9 +13,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/clearedstack/keelworks/internal/fault"
-	"github.com/clearedstack/keelworks/internal/push"
-	"github.com/clearedstack/keelworks/internal/testjob"
+	"github.com/ClearedStack/keelworks/internal/caller"
+	"github.com/ClearedStack/keelworks/internal/fault"
+	"github.com/ClearedStack/keelworks/internal/push"
+	"github.com/ClearedStack/keelworks/internal/testjob"
 )
 
 // StateRunning is the state of a run whose Job has not ended.
@@ -26,6 +27,7 @@ type Config struct {
 	TestImage     string        // image that fetches a commit and runs its tests
 	PriorityClass string        // PriorityClass for test Jobs
 	JobTimeout    time.Duration // how long a test Job may take
+	ReviewTimeout time.Duration // how long the cluster may take to check a caller's token
 	MaxRuns       int           // how many runs are remembered
 }
 
@@ -38,6 +40,8 @@ func (c Config) Validate() error {
 		return errors.New("no priority class is configured")
 	case c.JobTimeout < time.Second:
 		return errors.New("the job timeout must be at least one second")
+	case c.ReviewTimeout <= 0:
+		return errors.New("no token review timeout is configured")
 	case c.MaxRuns < 1:
 		return errors.New("the number of remembered runs must be at least one")
 	}
@@ -72,24 +76,29 @@ type run struct {
 
 // Controller implements http.Handler.
 type Controller struct {
-	cfg     Config
-	cluster testjob.Cluster
-	ctx     context.Context
-	stop    context.CancelFunc
-	wg      sync.WaitGroup
+	cfg      Config
+	cluster  testjob.Cluster
+	reviewer caller.Reviewer
+	ctx      context.Context
+	stop     context.CancelFunc
+	wg       sync.WaitGroup
 
 	mu    sync.Mutex
 	runs  map[string]*run
 	order []string // run ids, oldest first
 }
 
-// New returns a Controller that launches Jobs on cluster.
-func New(cfg Config, cluster testjob.Cluster) (*Controller, error) {
+// New returns a Controller that launches Jobs on cluster and admits a push
+// notification only when reviewer says it comes from Plainforge.
+func New(cfg Config, cluster testjob.Cluster, reviewer caller.Reviewer) (*Controller, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	if cluster == nil || reviewer == nil {
+		return nil, errors.New("no cluster or no token reviewer is given")
+	}
 	ctx, stop := context.WithCancel(context.Background())
-	return &Controller{cfg: cfg, cluster: cluster, ctx: ctx, stop: stop, runs: map[string]*run{}}, nil
+	return &Controller{cfg: cfg, cluster: cluster, reviewer: reviewer, ctx: ctx, stop: stop, runs: map[string]*run{}}, nil
 }
 
 // Close stops every running Job and waits for the runs to be recorded.
@@ -127,6 +136,29 @@ func (c *Controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *Controller) webhook(w http.ResponseWriter, r *http.Request) {
+	// Who is calling comes first. Nothing of the body is read for a caller
+	// that is not Plainforge.
+	switch caller.Check(r.Context(), c.reviewer, c.cfg.ReviewTimeout, r.Header.Values("Authorization")) {
+	case caller.Allowed:
+	case caller.NoToken:
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		write(w, http.StatusUnauthorized, answer{Status: "refused", Detail: "no bearer token"})
+		return
+	case caller.BadToken:
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		write(w, http.StatusUnauthorized, answer{Status: "refused", Detail: "bearer token is not valid"})
+		return
+	case caller.NotPlainforge:
+		write(w, http.StatusForbidden, answer{Status: "refused", Detail: "caller is not Plainforge"})
+		return
+	case caller.TimedOut:
+		write(w, http.StatusServiceUnavailable, answer{Status: "refused", Code: fault.Timeout, Detail: "token check took too long"})
+		return
+	default:
+		write(w, http.StatusServiceUnavailable, answer{Status: "refused", Detail: "token could not be checked"})
+		return
+	}
+
 	body, err := io.ReadAll(io.LimitReader(r.Body, push.MaxBody+1))
 	if err != nil {
 		write(w, http.StatusBadRequest, answer{Status: "refused", Code: fault.Parse, Detail: "body could not be read"})
@@ -170,7 +202,7 @@ func (c *Controller) start(ev push.Event) (id string, started, full bool) {
 		RunID:         id,
 		Repository:    ev.Repository,
 		Ref:           ev.Ref,
-		Commit:        ev.Commit,
+		Commit:        ev.After,
 		Image:         c.cfg.TestImage,
 		PriorityClass: c.cfg.PriorityClass,
 		Deadline:      c.cfg.JobTimeout,
@@ -191,7 +223,7 @@ func (c *Controller) start(ev push.Event) (id string, started, full bool) {
 		return id, false, true
 	}
 	rn := &run{
-		report: Report{Run: id, Repository: ev.Repository, Ref: ev.Ref, Commit: ev.Commit, Job: spec.Name(), State: StateRunning},
+		report: Report{Run: id, Repository: ev.Repository, Ref: ev.Ref, Commit: ev.After, Job: spec.Name(), State: StateRunning},
 		done:   make(chan struct{}),
 	}
 	c.runs[id] = rn

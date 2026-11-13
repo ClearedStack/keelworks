@@ -1,6 +1,7 @@
 // Command keelworks is the Keelworks controller.
 //
-// Today it runs only against in-memory stand-ins (-standin FILE). The
+// Today it runs only against in-memory stand-ins (-standin FILE): the Jobs
+// and the answers about callers' tokens are played back from the script. The
 // launcher for a real Kubernetes cluster is not built yet, and without
 // -standin the command refuses to start rather than pretend.
 package main
@@ -16,8 +17,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/clearedstack/keelworks/internal/controller"
-	"github.com/clearedstack/keelworks/internal/standin"
+	"github.com/ClearedStack/keelworks/internal/controller"
+	"github.com/ClearedStack/keelworks/internal/standin"
 )
 
 func main() {
@@ -35,6 +36,7 @@ func run(args []string) error {
 	fs.StringVar(&cfg.TestImage, "test-image", "", "image that fetches a commit and runs its tests (required)")
 	fs.StringVar(&cfg.PriorityClass, "priority-class", "", "PriorityClass for test Jobs (required)")
 	fs.DurationVar(&cfg.JobTimeout, "job-timeout", 0, "how long a test Job may take, for example 10m (required)")
+	fs.DurationVar(&cfg.ReviewTimeout, "token-review-timeout", 0, "how long the cluster may take to check a caller's token, for example 5s (required)")
 	fs.IntVar(&cfg.MaxRuns, "max-runs", 256, "how many runs are remembered")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -53,7 +55,7 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	ctl, err := controller.New(cfg, standin.NewCluster(parsed))
+	ctl, err := controller.New(cfg, standin.NewCluster(parsed), standin.NewReviewer(parsed))
 	if err != nil {
 		return err
 	}
@@ -71,7 +73,7 @@ func run(args []string) error {
 	defer stop()
 	failed := make(chan error, 1)
 	go func() { failed <- srv.ListenAndServe() }()
-	fmt.Fprintln(os.Stderr, "keelworks: listening with the in-memory stand-in cluster")
+	fmt.Fprintln(os.Stderr, "keelworks: listening with the in-memory stand-in cluster and its made-up tokens")
 
 	select {
 	case <-failed:

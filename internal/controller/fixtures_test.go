@@ -14,18 +14,22 @@ import (
 	"testing"
 	"time"
 
-	"github.com/clearedstack/keelworks/internal/standin"
+	"github.com/ClearedStack/keelworks/internal/standin"
 )
 
 var update = flag.Bool("update", false, "rewrite the expected files under fixtures/cases")
 
 const fixtures = "../../fixtures"
 
+// plainforgeToken is the made-up token fixtures/standin.json gives Plainforge.
+const plainforgeToken = "made-up-token-of-plainforge"
+
 func testConfig() Config {
 	return Config{
 		TestImage:     "lazarette.clearedstack.svc.cluster.local:5000/made-up-test-image",
 		PriorityClass: "made-up-low-priority",
 		JobTimeout:    10 * time.Minute,
+		ReviewTimeout: time.Second,
 		MaxRuns:       8,
 	}
 }
@@ -62,7 +66,7 @@ func TestSavedExamples(t *testing.T) {
 				}
 			}
 			cluster := standin.NewCluster(script(t))
-			ctl, err := New(cfg, cluster)
+			ctl, err := New(cfg, cluster, standin.NewReviewer(script(t)))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -72,7 +76,15 @@ func TestSavedExamples(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			status, answer := standin.Plainforge{Keelworks: ctl}.Deliver(body)
+			// The call carries Plainforge's token unless the case saves the
+			// Authorization header values to send instead, one per line.
+			authorization := []string{"Bearer " + plainforgeToken}
+			if raw, err := os.ReadFile(filepath.Join(dir, "authorization.txt")); err == nil {
+				authorization = strings.FieldsFunc(string(raw), func(r rune) bool { return r == '\n' })
+			} else if !errors.Is(err, fs.ErrNotExist) {
+				t.Fatal(err)
+			}
+			status, _, answer := standin.Call(ctl, authorization, body)
 			response := fmt.Sprintf("HTTP %d\n\n%s", status, answer)
 			check(t, filepath.Join(dir, "response.txt"), []byte(response))
 
