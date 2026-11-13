@@ -1,3 +1,0 @@
-HTTP 200
-
-{"status":"ignored","reason":"skip-ci"}

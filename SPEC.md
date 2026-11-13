@@ -28,7 +28,7 @@ When Plainforge receives a commit on `main` or a new tag, Keelworks spawns an ep
 
 Keelworks coordinates four internal control-plane interfaces:
 
-1. **Webhook Intake (Plainforge -> Keelworks):** Receives cluster-private push and tag webhooks from Plainforge. Commits containing `[skip-ci]` in the commit message are ignored to prevent recursive build loops.
+1. **Webhook Intake (Plainforge -> Keelworks):** Receives cluster-private push and tag webhooks from Plainforge, in the format of [`contract/v1/push.md`](contract/v1/push.md). Each webhook must carry a bearer token of Plainforge's ServiceAccount, which Keelworks checks with a Kubernetes `TokenReview`. Plainforge decides whether a commit containing `[skip-ci]` in its message is announced at all; Keelworks does not receive commit messages.
 2. **Ephemeral Job Orchestration (Kubernetes API):** Spawns short-lived `Job` pods in `clearedstack` with the appropriate builder:
    - `ko`: Compiles Go binaries (Plainforge, Lazarette, Keelworks, Shipkeeper, Muster, and Trawl through Bellbuoy) directly into minimal OCI images with zero Dockerfile or Docker daemon.
    - **Rootless BuildKit:** Builds multi-layer container images for Next.js web workloads (Conn) inside an unprivileged, rootless pod.
@@ -51,7 +51,7 @@ Keelworks is a control-plane build controller and does not host `tools/<case>/` 
 
 - **Zero Docker daemon:** No Docker socket (`/var/run/docker.sock`), privileged containers, or root-level build daemons exist anywhere on the host or inside build `Job` pods.
 - **Rootless & unprivileged:** Both the Keelworks controller and its spawned `ko` / rootless BuildKit `Job`s run as non-root users with dropped Linux capabilities and no privilege escalation.
-- **Cluster-private only:** Keelworks has no public Ingress and accepts webhooks exclusively from Plainforge under default-deny `NetworkPolicy` rules.
+- **Cluster-private only:** Keelworks has no public Ingress and accepts webhooks exclusively from Plainforge under default-deny `NetworkPolicy` rules. A webhook without a valid token of Plainforge's ServiceAccount is refused.
 - **Supply-chain integrity:** Every published image is tested against golden fixtures and cryptographically signed with `cosign` before `app.yaml` is updated.
 
 ## Related pages

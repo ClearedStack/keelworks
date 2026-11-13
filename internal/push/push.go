@@ -1,6 +1,6 @@
 // Package push reads a push notification from Plainforge and decides what
 // Keelworks does with it. It is pure: the same bytes always give the same
-// decision.
+// decision. The format is written down in contract/v1/push.md.
 package push
 
 import (
@@ -9,30 +9,26 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
-	"sort"
 	"strings"
 
-	"github.com/clearedstack/keelworks/internal/fault"
+	"github.com/ClearedStack/keelworks/internal/fault"
 )
 
 // MaxBody is the largest notification body Keelworks reads, in bytes.
 const MaxBody = 64 << 10
 
-// SkipMarker in a commit message means the commit is not built.
-const SkipMarker = "[skip-ci]"
-
-// Reasons a valid notification is ignored.
-const (
-	ReasonSkipCI        = "skip-ci"
-	ReasonBranchNotMain = "branch-not-main"
-)
+// ReasonBranchNotMain is why a valid push to a branch other than main is
+// ignored. It is the only reason Keelworks ignores a notification: whether a
+// push is announced at all, the [skip-ci] rule included, is decided by
+// Plainforge before it sends.
+const ReasonBranchNotMain = "branch-not-main"
 
 // Event is a valid push notification.
 type Event struct {
 	Repository string
 	Ref        string
-	Commit     string
-	Message    string
+	Before     string // the commit the ref pointed at before the push
+	After      string // the commit the ref points at now; the one that is tested
 }
 
 // Decision says what to do with a valid notification. Ignore is empty when
@@ -43,13 +39,15 @@ type Decision struct {
 }
 
 // RunID names the run for this event. It depends only on the repository,
-// the ref and the commit, so a notification delivered twice names one run.
+// the ref and the commit that is tested, so a notification delivered twice
+// names one run.
 func (e Event) RunID() string {
-	sum := sha256.Sum256([]byte(e.Repository + "\x00" + e.Ref + "\x00" + e.Commit))
+	sum := sha256.Sum256([]byte(e.Repository + "\x00" + e.Ref + "\x00" + e.After))
 	return e.Repository + "-" + hex.EncodeToString(sum[:6])
 }
 
-var fields = []string{"commit", "message", "ref", "repository"}
+// fields are the notification's field names, in the order they are checked.
+var fields = []string{"after", "before", "ref", "repository"}
 
 // Decide parses a notification body and applies the intake rules in a fixed
 // order. Every refusal is a *fault.Fault.
@@ -76,31 +74,32 @@ func Decide(body []byte) (Decision, error) {
 			return Decision{}, fault.New(fault.Parse, "field "+name+" is not a string")
 		}
 		switch name {
-		case "commit":
-			ev.Commit = s
-		case "message":
-			ev.Message = s
+		case "after":
+			ev.After = s
+		case "before":
+			ev.Before = s
 		case "ref":
 			ev.Ref = s
 		case "repository":
 			ev.Repository = s
 		}
 	}
-	if !validRepository(ev.Repository) {
-		return Decision{}, fault.New(fault.Parse, "field repository is malformed")
-	}
-	if !validCommit(ev.Commit) {
-		return Decision{}, fault.New(fault.Parse, "field commit is malformed")
-	}
-	if !validRef(ev.Ref) {
+	switch {
+	case !validCommit(ev.After):
+		return Decision{}, fault.New(fault.Parse, "field after is malformed")
+	case !validCommit(ev.Before):
+		return Decision{}, fault.New(fault.Parse, "field before is malformed")
+	case !validRef(ev.Ref):
 		return Decision{}, fault.New(fault.Parse, "field ref is malformed")
+	case !validRepository(ev.Repository):
+		return Decision{}, fault.New(fault.Parse, "field repository is malformed")
 	}
 
 	// Valid and unfamiliar next.
 	if len(raw) > len(fields) {
 		return Decision{}, fault.New(fault.NeedsSubtool, "notification has a field no rule covers")
 	}
-	if strings.Trim(ev.Commit, "0") == "" {
+	if strings.Trim(ev.After, "0") == "" {
 		return Decision{}, fault.New(fault.NeedsSubtool, "no rule for a deleted ref")
 	}
 	branch, isBranch := strings.CutPrefix(ev.Ref, "refs/heads/")
@@ -110,9 +109,6 @@ func Decide(body []byte) (Decision, error) {
 	}
 
 	// Valid and familiar: test it or ignore it.
-	if strings.Contains(ev.Message, SkipMarker) {
-		return Decision{Event: ev, Ignore: ReasonSkipCI}, nil
-	}
 	if isBranch && branch != "main" {
 		return Decision{Event: ev, Ignore: ReasonBranchNotMain}, nil
 	}
@@ -182,12 +178,4 @@ func validRef(s string) bool {
 	parts := strings.SplitN(s, "/", 3)
 	return len(parts) == 3 && parts[0] == "refs" && parts[1] != "" && parts[2] != "" &&
 		!strings.HasSuffix(s, "/") && !strings.Contains(s, "//")
-}
-
-// Fields lists the notification's field names, sorted. It documents the
-// contract for the stand-in.
-func Fields() []string {
-	out := append([]string(nil), fields...)
-	sort.Strings(out)
-	return out
 }

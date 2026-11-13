@@ -4,30 +4,38 @@ import (
 	"bytes"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
-	"github.com/clearedstack/keelworks/internal/push"
-	"github.com/clearedstack/keelworks/internal/standin"
-	"github.com/clearedstack/keelworks/internal/testjob"
+	"github.com/ClearedStack/keelworks/internal/push"
+	"github.com/ClearedStack/keelworks/internal/standin"
+	"github.com/ClearedStack/keelworks/internal/testjob"
 )
 
 const (
+	earlier   = "abababababababababababababababababababab"
 	passing   = "1111111111111111111111111111111111111111"
 	stalling  = "4444444444444444444444444444444444444444"
 	preempted = "5555555555555555555555555555555555555555"
 )
 
-func setup(t *testing.T, cfg Config) (*Controller, *standin.Cluster, standin.Plainforge) {
+type fixture struct {
+	ctl      *Controller
+	cluster  *standin.Cluster
+	reviewer *standin.Reviewer
+	forge    standin.Plainforge
+}
+
+func setup(t *testing.T, cfg Config) fixture {
 	t.Helper()
 	cluster := standin.NewCluster(script(t))
-	ctl, err := New(cfg, cluster)
+	reviewer := standin.NewReviewer(script(t))
+	ctl, err := New(cfg, cluster, reviewer)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(ctl.Close)
-	return ctl, cluster, standin.Plainforge{Keelworks: ctl}
+	return fixture{ctl, cluster, reviewer, standin.Plainforge{Keelworks: ctl, Token: plainforgeToken}}
 }
 
 func wait(t *testing.T, ctl *Controller, id string) Report {
@@ -41,108 +49,192 @@ func wait(t *testing.T, ctl *Controller, id string) Report {
 	return report
 }
 
-func runID(repository, ref, commit string) string {
-	return push.Event{Repository: repository, Ref: ref, Commit: commit}.RunID()
+func runID(repository, ref, after string) string {
+	return push.Event{Repository: repository, Ref: ref, After: after}.RunID()
 }
 
 func TestSecondDeliveryStartsNothing(t *testing.T) {
-	ctl, cluster, forge := setup(t, testConfig())
+	f := setup(t, testConfig())
 	id := runID("muster", "refs/heads/main", passing)
 
-	status, body := forge.Push("muster", "refs/heads/main", passing, "Tidy the roll call")
+	status, body := f.forge.Push("muster", "refs/heads/main", earlier, passing)
 	if status != http.StatusAccepted {
 		t.Fatalf("first delivery: status %d, body %s", status, body)
 	}
-	wait(t, ctl, id)
-	status, body = forge.Push("muster", "refs/heads/main", passing, "Tidy the roll call")
+	wait(t, f.ctl, id)
+	status, body = f.forge.Push("muster", "refs/heads/main", earlier, passing)
 	want := `{"status":"known","run":"` + id + `"}` + "\n"
 	if status != http.StatusOK || string(body) != want {
 		t.Fatalf("second delivery: status %d, body %s, want 200 %s", status, body, want)
 	}
-	if n := len(cluster.Created()); n != 1 {
+	if n := len(f.cluster.Created()); n != 1 {
 		t.Fatalf("%d Jobs were created, want 1", n)
 	}
 }
 
 func TestInterruptedRunIsRetriedOnRedelivery(t *testing.T) {
-	ctl, cluster, forge := setup(t, testConfig())
+	f := setup(t, testConfig())
 	id := runID("plainforge", "refs/heads/main", preempted)
 	for i := 1; i <= 2; i++ {
-		status, _ := forge.Push("plainforge", "refs/heads/main", preempted, "Sort the branch list")
+		status, _ := f.forge.Push("plainforge", "refs/heads/main", earlier, preempted)
 		if status != http.StatusAccepted {
 			t.Fatalf("delivery %d: status %d, want 202", i, status)
 		}
-		if r := wait(t, ctl, id); r.State != testjob.StateInterrupted || r.Reason != testjob.ReasonPreempted {
+		if r := wait(t, f.ctl, id); r.State != testjob.StateInterrupted || r.Reason != testjob.ReasonPreempted {
 			t.Fatalf("delivery %d: report %+v", i, r)
 		}
 	}
-	if n := len(cluster.Created()); n != 2 {
+	if n := len(f.cluster.Created()); n != 2 {
 		t.Fatalf("%d Jobs were created, want 2", n)
 	}
 }
 
 func TestBodyOverTheLimitIsRefused(t *testing.T) {
-	_, cluster, forge := setup(t, testConfig())
-	body := standin.Notification("muster", "refs/heads/main", passing, strings.Repeat("a", push.MaxBody))
-	status, answer := forge.Deliver(body)
+	f := setup(t, testConfig())
+	body := append(standin.Notification("muster", "refs/heads/main", earlier, passing), bytes.Repeat([]byte(" "), push.MaxBody)...)
+	status, answer := f.forge.Deliver(body)
 	want := `{"status":"refused","code":"E_PARSE","detail":"body is too large"}` + "\n"
 	if status != http.StatusBadRequest || string(answer) != want {
 		t.Fatalf("status %d, body %s", status, answer)
 	}
-	if len(cluster.Created()) != 0 {
+	if len(f.cluster.Created()) != 0 {
 		t.Fatal("a Job was created")
+	}
+}
+
+func TestTheCommitBeforeDoesNotChangeTheRun(t *testing.T) {
+	f := setup(t, testConfig())
+	id := runID("muster", "refs/heads/main", passing)
+	if status, _ := f.forge.Push("muster", "refs/heads/main", earlier, passing); status != http.StatusAccepted {
+		t.Fatalf("status %d, want 202", status)
+	}
+	wait(t, f.ctl, id)
+	status, body := f.forge.Push("muster", "refs/heads/main", preempted, passing)
+	want := `{"status":"known","run":"` + id + `"}` + "\n"
+	if status != http.StatusOK || string(body) != want {
+		t.Fatalf("status %d, body %s, want 200 %s", status, body, want)
+	}
+}
+
+// TestCallerIsCheckedBeforeAnythingElse sends bodies that would be refused
+// for their own sake and expects the answer about the caller instead.
+func TestCallerIsCheckedBeforeAnythingElse(t *testing.T) {
+	f := setup(t, testConfig())
+	for _, body := range []string{"", "{", `{"repository":"muster"}`} {
+		status, header, answer := standin.Call(f.ctl, nil, []byte(body))
+		want := `{"status":"refused","detail":"no bearer token"}` + "\n"
+		if status != http.StatusUnauthorized || string(answer) != want || header.Get("WWW-Authenticate") != "Bearer" {
+			t.Errorf("body %q: status %d, header %v, answer %s", body, status, header, answer)
+		}
+	}
+	if n := f.reviewer.Reviews(); n != 0 {
+		t.Fatalf("the cluster was asked %d times about calls that carried no token", n)
+	}
+
+	status, header, _ := standin.Call(f.ctl, []string{"Bearer made-up-token-nobody-holds"}, []byte("{"))
+	if status != http.StatusUnauthorized || header.Get("WWW-Authenticate") != "Bearer" {
+		t.Errorf("unknown token: status %d, header %v", status, header)
+	}
+	status, _, _ = standin.Call(f.ctl, []string{"Bearer made-up-token-of-muster"}, []byte("{"))
+	if status != http.StatusForbidden {
+		t.Errorf("another service account: status %d, want 403", status)
+	}
+	if n := f.reviewer.Reviews(); n != 2 {
+		t.Fatalf("the cluster was asked %d times, want 2", n)
+	}
+	if n := len(f.cluster.Created()); n != 0 {
+		t.Fatalf("%d Jobs were created", n)
+	}
+}
+
+func TestEveryDeliveryIsCheckedAgain(t *testing.T) {
+	f := setup(t, testConfig())
+	for i := 0; i < 3; i++ {
+		f.forge.Push("muster", "refs/heads/main", earlier, passing)
+	}
+	if n := f.reviewer.Reviews(); n != 3 {
+		t.Fatalf("the cluster was asked %d times for 3 deliveries", n)
+	}
+}
+
+func TestMalformedBearerTokensNeverReachTheCluster(t *testing.T) {
+	f := setup(t, testConfig())
+	body := standin.Notification("muster", "refs/heads/main", earlier, passing)
+	for _, value := range []string{
+		"",
+		"Bearer",
+		"Bearer ",
+		"bearer " + plainforgeToken,
+		"Bearer  " + plainforgeToken,
+		"Bearer " + plainforgeToken + " ",
+		"Bearer made up",
+		"Bearer ====",
+		"Bearer made=up",
+		"Bearer " + string(bytes.Repeat([]byte("a"), 4097)),
+		plainforgeToken,
+	} {
+		status, _, answer := standin.Call(f.ctl, []string{value}, body)
+		want := `{"status":"refused","detail":"no bearer token"}` + "\n"
+		if status != http.StatusUnauthorized || string(answer) != want {
+			t.Errorf("Authorization %.40q: status %d, answer %s", value, status, answer)
+		}
+	}
+	if n := f.reviewer.Reviews(); n != 0 {
+		t.Fatalf("the cluster was asked %d times", n)
+	}
+	if n := len(f.cluster.Created()); n != 0 {
+		t.Fatalf("%d Jobs were created", n)
 	}
 }
 
 func TestTableFullRefusesAndFinishedRunsMakeRoom(t *testing.T) {
 	cfg := testConfig()
 	cfg.MaxRuns = 1
-	ctl, _, forge := setup(t, cfg)
+	f := setup(t, cfg)
 
-	if status, _ := forge.Push("shipkeeper", "refs/heads/main", stalling, "Add a slow test"); status != http.StatusAccepted {
+	if status, _ := f.forge.Push("shipkeeper", "refs/heads/main", earlier, stalling); status != http.StatusAccepted {
 		t.Fatalf("status %d, want 202", status)
 	}
-	status, body := forge.Push("muster", "refs/heads/main", passing, "Tidy the roll call")
+	status, body := f.forge.Push("muster", "refs/heads/main", earlier, passing)
 	want := `{"status":"refused","detail":"too many runs in progress"}` + "\n"
 	if status != http.StatusServiceUnavailable || string(body) != want {
 		t.Fatalf("status %d, body %s", status, body)
 	}
 
 	// A second controller whose only run has finished gives its place away.
-	ctl2, _, forge2 := setup(t, cfg)
+	g := setup(t, cfg)
 	first := runID("muster", "refs/heads/main", passing)
-	forge2.Push("muster", "refs/heads/main", passing, "Tidy the roll call")
-	wait(t, ctl2, first)
-	if status, _ := forge2.Push("muster", "refs/tags/v1", passing, "Tag it"); status != http.StatusAccepted {
+	g.forge.Push("muster", "refs/heads/main", earlier, passing)
+	wait(t, g.ctl, first)
+	if status, _ := g.forge.Push("muster", "refs/tags/v1", earlier, passing); status != http.StatusAccepted {
 		t.Fatalf("status %d, want 202", status)
 	}
-	if _, ok := ctl2.Report(first); ok {
+	if _, ok := g.ctl.Report(first); ok {
 		t.Fatal("the oldest finished run was not forgotten")
 	}
-	_ = ctl
 }
 
 func TestCloseInterruptsARunningJobAndLeavesNoneBehind(t *testing.T) {
-	ctl, cluster, forge := setup(t, testConfig())
+	f := setup(t, testConfig())
 	id := runID("shipkeeper", "refs/heads/main", stalling)
-	forge.Push("shipkeeper", "refs/heads/main", stalling, "Add a slow test")
-	if r, _ := ctl.Report(id); r.State != StateRunning {
+	f.forge.Push("shipkeeper", "refs/heads/main", earlier, stalling)
+	if r, _ := f.ctl.Report(id); r.State != StateRunning {
 		t.Fatalf("state %q, want running", r.State)
 	}
-	ctl.Close()
-	if r, _ := ctl.Report(id); r.State != testjob.StateInterrupted || r.Reason != testjob.ReasonShutdown {
+	f.ctl.Close()
+	if r, _ := f.ctl.Report(id); r.State != testjob.StateInterrupted || r.Reason != testjob.ReasonShutdown {
 		t.Fatalf("report %+v", r)
 	}
-	if n := cluster.Live(); n != 0 {
+	if n := f.cluster.Live(); n != 0 {
 		t.Fatalf("%d Jobs were left behind", n)
 	}
-	if status, _ := forge.Push("muster", "refs/heads/main", passing, "After close"); status != http.StatusServiceUnavailable {
+	if status, _ := f.forge.Push("muster", "refs/heads/main", earlier, passing); status != http.StatusServiceUnavailable {
 		t.Fatalf("status %d after Close, want 503", status)
 	}
 }
 
 func TestOtherPathsAndMethods(t *testing.T) {
-	ctl, _, _ := setup(t, testConfig())
+	f := setup(t, testConfig())
 	cases := []struct {
 		method, path string
 		status       int
@@ -157,7 +249,7 @@ func TestOtherPathsAndMethods(t *testing.T) {
 	}
 	for _, c := range cases {
 		rec := httptest.NewRecorder()
-		ctl.ServeHTTP(rec, httptest.NewRequest(c.method, c.path, bytes.NewReader(nil)))
+		f.ctl.ServeHTTP(rec, httptest.NewRequest(c.method, c.path, bytes.NewReader(nil)))
 		if rec.Code != c.status || rec.Body.String() != c.body+"\n" {
 			t.Errorf("%s %s: status %d, body %s", c.method, c.path, rec.Code, rec.Body)
 		}
@@ -169,13 +261,17 @@ func TestConfigWithAnythingMissingIsRefused(t *testing.T) {
 		func(c *Config) { c.TestImage = "" },
 		func(c *Config) { c.PriorityClass = "" },
 		func(c *Config) { c.JobTimeout = 0 },
+		func(c *Config) { c.ReviewTimeout = 0 },
 		func(c *Config) { c.MaxRuns = 0 },
 	}
 	for i, breakIt := range broken {
 		cfg := testConfig()
 		breakIt(&cfg)
-		if _, err := New(cfg, standin.NewCluster(standin.Script{})); err == nil {
+		if _, err := New(cfg, standin.NewCluster(standin.Script{}), standin.NewReviewer(standin.Script{})); err == nil {
 			t.Errorf("case %d: a broken configuration was accepted", i)
 		}
+	}
+	if _, err := New(testConfig(), standin.NewCluster(standin.Script{}), nil); err == nil {
+		t.Error("a controller without a token reviewer was accepted")
 	}
 }

@@ -5,7 +5,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/clearedstack/keelworks/internal/fault"
+	"github.com/ClearedStack/keelworks/internal/fault"
 )
 
 // Outcome is how a Job ended, as the cluster reports it.

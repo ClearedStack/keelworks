@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/clearedstack/keelworks/internal/testjob"
+	"github.com/ClearedStack/keelworks/internal/testjob"
 )
 
 func rendered() string {
