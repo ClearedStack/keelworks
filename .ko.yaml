@@ -19,3 +19,12 @@ builds:
     ldflags:
       - -s
       - -w
+  - id: keelworks-builder
+    main: ./cmd/keelworks-builder
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s
+      - -w
