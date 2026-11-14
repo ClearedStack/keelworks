@@ -33,6 +33,7 @@ func TestDeployManifestsAndRepoHygiene(t *testing.T) {
 	deployText := string(deployRaw)
 	for _, want := range []string{
 		"namespace: clearedstack",
+		"priorityClassName: clearedstack-high",
 		"runAsNonRoot: true",
 		"readOnlyRootFilesystem: true",
 		"allowPrivilegeEscalation: false",
@@ -46,6 +47,17 @@ func TestDeployManifestsAndRepoHygiene(t *testing.T) {
 	} {
 		if !strings.Contains(deployText, want) {
 			t.Errorf("deploy/deployment.yaml missing %q", want)
+		}
+	}
+
+	prioRaw, err := os.ReadFile(filepath.Join(root, "deploy", "priorityclass.yaml"))
+	if err != nil {
+		t.Fatalf("read deploy/priorityclass.yaml: %v", err)
+	}
+	prioText := string(prioRaw)
+	for _, want := range []string{"name: cs-build-low", "name: clearedstack-high", "value: 100000"} {
+		if !strings.Contains(prioText, want) {
+			t.Errorf("deploy/priorityclass.yaml missing %q", want)
 		}
 	}
 
