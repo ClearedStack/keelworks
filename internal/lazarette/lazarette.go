@@ -17,6 +17,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -77,25 +78,51 @@ func ParsePublicKey(pemData []byte) (*ecdsa.PublicKey, error) {
 	return pub, nil
 }
 
+// KeySource returns the trusted ECDSA P-256 public key for signature checks.
+type KeySource func() (*ecdsa.PublicKey, error)
+
+// FilePublicKey returns a KeySource that re-reads and parses path on each call
+// so rotating a mounted Kubernetes Secret (cosign.pub) takes effect without
+// restarting Keelworks.
+func FilePublicKey(path string) KeySource {
+	return func() (*ecdsa.PublicKey, error) {
+		pemData, err := os.ReadFile(path)
+		if err != nil {
+			return nil, errors.New("cosign public key file could not be read")
+		}
+		return ParsePublicKey(pemData)
+	}
+}
+
 // OCIVerifier checks Lazarette over cluster-private HTTP using the OCI
 // Distribution v1.1 API (with fallback to cosign .sig tags) and verifies
 // ECDSA P-256 signatures in memory.
 type OCIVerifier struct {
-	base    string
-	client  *http.Client
-	pub     *ecdsa.PublicKey
-	timeout time.Duration
+	base      string
+	client    *http.Client
+	keySource KeySource
+	timeout   time.Duration
 }
 
-// NewOCIVerifier returns an OCIVerifier talking to base (for example
-// "http://lazarette.clearedstack.svc.cluster.local:5000").
+// NewOCIVerifier returns an OCIVerifier pinned to a fixed in-memory public key.
 func NewOCIVerifier(base string, client *http.Client, pub *ecdsa.PublicKey, timeout time.Duration) (*OCIVerifier, error) {
+	if pub == nil {
+		return nil, errors.New("no cosign public key is configured")
+	}
+	return NewDynamicOCIVerifier(base, client, func() (*ecdsa.PublicKey, error) {
+		return pub, nil
+	}, timeout)
+}
+
+// NewDynamicOCIVerifier returns an OCIVerifier that resolves the trusted
+// public key from keySource on each verification call.
+func NewDynamicOCIVerifier(base string, client *http.Client, keySource KeySource, timeout time.Duration) (*OCIVerifier, error) {
 	u, err := url.Parse(strings.TrimRight(base, "/"))
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return nil, errors.New("lazarette URL must be http or https with a host")
 	}
-	if pub == nil {
-		return nil, errors.New("no cosign public key is configured")
+	if keySource == nil {
+		return nil, errors.New("no cosign public key source is configured")
 	}
 	if timeout <= 0 {
 		return nil, errors.New("no lazarette timeout is configured")
@@ -105,7 +132,7 @@ func NewOCIVerifier(base string, client *http.Client, pub *ecdsa.PublicKey, time
 		c = *client
 	}
 	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	return &OCIVerifier{base: u.String(), client: &c, pub: pub, timeout: timeout}, nil
+	return &OCIVerifier{base: u.String(), client: &c, keySource: keySource, timeout: timeout}, nil
 }
 
 // Verify checks that image@digest exists in Lazarette and has a valid cosign
@@ -113,6 +140,10 @@ func NewOCIVerifier(base string, client *http.Client, pub *ecdsa.PublicKey, time
 func (v *OCIVerifier) Verify(ctx context.Context, image, digest string) Status {
 	if image == "" || !registry.ValidDigest(digest) {
 		return Unsigned
+	}
+	pub, err := v.keySource()
+	if err != nil || pub == nil {
+		return Unavailable
 	}
 	callCtx, cancel := context.WithTimeout(ctx, v.timeout)
 	defer cancel()
@@ -140,7 +171,7 @@ func (v *OCIVerifier) Verify(ctx context.Context, image, digest string) Status {
 		return st
 	}
 	for _, rawManifest := range manifests {
-		switch v.verifyManifest(ctx, callCtx, image, digest, rawManifest) {
+		switch v.verifyManifest(ctx, callCtx, pub, image, digest, rawManifest) {
 		case Verified:
 			return Verified
 		case TimedOut:
@@ -232,7 +263,7 @@ func (v *OCIVerifier) signatureManifests(callCtx context.Context, image, digest 
 	}
 }
 
-func (v *OCIVerifier) verifyManifest(parentCtx, callCtx context.Context, image, digest string, rawManifest []byte) Status {
+func (v *OCIVerifier) verifyManifest(parentCtx, callCtx context.Context, pub *ecdsa.PublicKey, image, digest string, rawManifest []byte) Status {
 	var m ociManifest
 	if json.Unmarshal(rawManifest, &m) != nil || m.SchemaVersion != 2 || len(m.Layers) == 0 || len(m.Layers) > maxLayers {
 		return Unsigned
@@ -260,7 +291,7 @@ func (v *OCIVerifier) verifyManifest(parentCtx, callCtx context.Context, image, 
 			continue
 		}
 		sum := sha256.Sum256(payload)
-		if !ecdsa.VerifyASN1(v.pub, sum[:], sigBytes) {
+		if !ecdsa.VerifyASN1(pub, sum[:], sigBytes) {
 			continue
 		}
 		var ss simpleSigning
