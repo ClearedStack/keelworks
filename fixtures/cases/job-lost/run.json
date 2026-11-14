@@ -1,1 +1,1 @@
-{"run":"keelworks-d82cd439f865","repository":"keelworks","ref":"refs/heads/main","commit":"6666666666666666666666666666666666666666","job":"keelworks-test-keelworks-d82cd439f865","state":"interrupted","reason":"job-lost"}
+{"run":"keelworks-d82cd439f865","repository":"keelworks","app":"keelworks","builder":"ko","ref":"refs/heads/main","commit":"6666666666666666666666666666666666666666","job":"keelworks-build-keelworks-d82cd439f865","state":"interrupted","reason":"job-lost"}

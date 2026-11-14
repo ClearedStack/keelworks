@@ -2,12 +2,13 @@
   "apiVersion": "batch/v1",
   "kind": "Job",
   "metadata": {
-    "name": "keelworks-test-muster-3982059ad880",
+    "name": "keelworks-build-muster-3982059ad880",
     "namespace": "clearedstack",
     "labels": {
-      "app.kubernetes.io/component": "test",
+      "app.kubernetes.io/component": "build",
       "app.kubernetes.io/instance": "muster-3982059ad880",
       "app.kubernetes.io/managed-by": "keelworks",
+      "app.kubernetes.io/name": "keelworks-build",
       "app.kubernetes.io/part-of": "muster"
     }
   },
@@ -17,22 +18,57 @@
     "template": {
       "metadata": {
         "labels": {
-          "app.kubernetes.io/component": "test",
+          "app.kubernetes.io/component": "build",
           "app.kubernetes.io/instance": "muster-3982059ad880",
           "app.kubernetes.io/managed-by": "keelworks",
+          "app.kubernetes.io/name": "keelworks-build",
           "app.kubernetes.io/part-of": "muster"
         }
       },
       "spec": {
+        "affinity": {
+          "nodeAffinity": {
+            "requiredDuringSchedulingIgnoredDuringExecution": {
+              "nodeSelectorTerms": [
+                {
+                  "matchExpressions": [
+                    {
+                      "key": "kubernetes.io/arch",
+                      "operator": "In",
+                      "values": [
+                        "arm64"
+                      ]
+                    },
+                    {
+                      "key": "kubernetes.io/hostname",
+                      "operator": "NotIn",
+                      "values": [
+                        "cm3588-plus"
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        },
         "automountServiceAccountToken": false,
         "containers": [
           {
-            "name": "test",
-            "image": "lazarette.clearedstack.svc.cluster.local:5000/made-up-test-image",
+            "name": "build",
+            "image": "lazarette.clearedstack.svc.cluster.local:5000/made-up-ko-builder@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "env": [
               {
                 "name": "KEELWORKS_REPOSITORY",
                 "value": "muster"
+              },
+              {
+                "name": "KEELWORKS_APP",
+                "value": "muster"
+              },
+              {
+                "name": "KEELWORKS_BUILDER",
+                "value": "ko"
               },
               {
                 "name": "KEELWORKS_REF",
@@ -41,8 +77,38 @@
               {
                 "name": "KEELWORKS_COMMIT",
                 "value": "2222222222222222222222222222222222222222"
+              },
+              {
+                "name": "KEELWORKS_PLAINFORGE_URL",
+                "value": "http://plainforge.clearedstack.svc.cluster.local:8080"
+              },
+              {
+                "name": "KEELWORKS_IMAGE",
+                "value": "lazarette.clearedstack.svc.cluster.local:5000/muster"
+              },
+              {
+                "name": "KEELWORKS_COSIGN_KEY",
+                "value": "/var/run/secrets/keelworks/cosign/cosign.key"
+              },
+              {
+                "name": "HOME",
+                "value": "/work"
+              },
+              {
+                "name": "TMPDIR",
+                "value": "/tmp"
               }
             ],
+            "resources": {
+              "limits": {
+                "cpu": "1",
+                "memory": "1Gi"
+              },
+              "requests": {
+                "cpu": "100m",
+                "memory": "128Mi"
+              }
+            },
             "securityContext": {
               "allowPrivilegeEscalation": false,
               "capabilities": {
@@ -51,18 +117,65 @@
                 ]
               },
               "privileged": false,
+              "readOnlyRootFilesystem": true,
               "runAsNonRoot": true
-            }
+            },
+            "terminationMessagePath": "/dev/termination-log",
+            "terminationMessagePolicy": "File",
+            "volumeMounts": [
+              {
+                "mountPath": "/work",
+                "name": "work"
+              },
+              {
+                "mountPath": "/tmp",
+                "name": "tmp"
+              },
+              {
+                "mountPath": "/var/run/secrets/keelworks/cosign",
+                "name": "signing-key",
+                "readOnly": true
+              }
+            ]
           }
         ],
-        "priorityClassName": "made-up-low-priority",
+        "priorityClassName": "cs-build-low",
         "restartPolicy": "Never",
         "securityContext": {
+          "fsGroup": 65532,
+          "runAsGroup": 65532,
           "runAsNonRoot": true,
+          "runAsUser": 65532,
           "seccompProfile": {
             "type": "RuntimeDefault"
           }
-        }
+        },
+        "volumes": [
+          {
+            "emptyDir": {
+              "sizeLimit": "1Gi"
+            },
+            "name": "work"
+          },
+          {
+            "emptyDir": {
+              "sizeLimit": "256Mi"
+            },
+            "name": "tmp"
+          },
+          {
+            "name": "signing-key",
+            "secret": {
+              "items": [
+                {
+                  "key": "cosign.key",
+                  "path": "cosign.key"
+                }
+              ],
+              "secretName": "keelworks-cosign"
+            }
+          }
+        ]
       }
     }
   }

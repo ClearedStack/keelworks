@@ -1,0 +1,19 @@
+# Cluster-private Service for Keelworks. There is no Ingress, NodePort or
+# LoadBalancer: only Plainforge in clearedstack may reach port 8080.
+apiVersion: v1
+kind: Service
+metadata:
+  name: keelworks
+  namespace: clearedstack
+  labels:
+    app.kubernetes.io/name: keelworks
+    app.kubernetes.io/part-of: clearedstack
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: keelworks
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8080
+      targetPort: http

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -26,8 +27,12 @@ const plainforgeToken = "made-up-token-of-plainforge"
 
 func testConfig() Config {
 	return Config{
-		TestImage:     "lazarette.clearedstack.svc.cluster.local:5000/made-up-test-image",
-		PriorityClass: "made-up-low-priority",
+		KoImage:       "lazarette.clearedstack.svc.cluster.local:5000/made-up-ko-builder@sha256:" + strings.Repeat("aa", 32),
+		BuildKitImage: "lazarette.clearedstack.svc.cluster.local:5000/made-up-buildkit-builder@sha256:" + strings.Repeat("bb", 32),
+		PlainforgeURL: "http://plainforge.clearedstack.svc.cluster.local:8080",
+		ImageRegistry: "lazarette.clearedstack.svc.cluster.local:5000",
+		CosignSecret:  "keelworks-cosign",
+		PriorityClass: "cs-build-low",
 		JobTimeout:    10 * time.Minute,
 		ReviewTimeout: time.Second,
 		MaxRuns:       8,
@@ -65,8 +70,11 @@ func TestSavedExamples(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			cluster := standin.NewCluster(script(t))
-			ctl, err := New(cfg, cluster, standin.NewReviewer(script(t)))
+			sc := script(t)
+			laz := standin.NewLazarette()
+			cluster := standin.NewCluster(sc, laz)
+			forgeStore := standin.NewForgeStore(sc)
+			ctl, err := New(cfg, cluster, standin.NewReviewer(sc), laz, forgeStore)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -76,8 +84,6 @@ func TestSavedExamples(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			// The call carries Plainforge's token unless the case saves the
-			// Authorization header values to send instead, one per line.
 			authorization := []string{"Bearer " + plainforgeToken}
 			if raw, err := os.ReadFile(filepath.Join(dir, "authorization.txt")); err == nil {
 				authorization = strings.FieldsFunc(string(raw), func(r rune) bool { return r == '\n' })
@@ -88,7 +94,7 @@ func TestSavedExamples(t *testing.T) {
 			response := fmt.Sprintf("HTTP %d\n\n%s", status, answer)
 			check(t, filepath.Join(dir, "response.txt"), []byte(response))
 
-			var job, report []byte
+			var job, report, pin []byte
 			if status == http.StatusAccepted {
 				id := strings.TrimSuffix(strings.SplitN(string(answer), `"run":"`, 2)[1], "\"}\n")
 				select {
@@ -107,20 +113,34 @@ func TestSavedExamples(t *testing.T) {
 					t.Fatalf("%d Jobs were created, want 1", len(created))
 				}
 				job = created[0]
-			} else if n := len(cluster.Created()); n != 0 {
-				t.Fatalf("%d Jobs were created for a notification that was not accepted", n)
+				if commits := forgeStore.Commits(); len(commits) > 0 {
+					if len(commits) != 1 {
+						t.Fatalf("%d Plainforge commits were written, want at most 1", len(commits))
+					}
+					encoded, err := json.MarshalIndent(commits[0], "", "  ")
+					if err != nil {
+						t.Fatal(err)
+					}
+					pin = append(encoded, '\n')
+				}
+			} else {
+				if n := len(cluster.Created()); n != 0 {
+					t.Fatalf("%d Jobs were created for a notification that was not accepted", n)
+				}
+				if n := len(forgeStore.Commits()); n != 0 {
+					t.Fatalf("%d Plainforge commits were written for a notification that was not accepted", n)
+				}
 			}
 			if n := cluster.Live(); n != 0 {
 				t.Fatalf("%d Jobs were left behind", n)
 			}
 			check(t, filepath.Join(dir, "job.json"), job)
 			check(t, filepath.Join(dir, "run.json"), report)
+			check(t, filepath.Join(dir, "pin.json"), pin)
 		})
 	}
 }
 
-// check compares got with the saved file. A nil got means the file must not
-// exist.
 func check(t *testing.T, path string, got []byte) {
 	t.Helper()
 	if *update {

@@ -1,6 +1,8 @@
 // Package controller is Keelworks' HTTP surface and its table of runs: it
-// takes push notifications in from Plainforge and from nobody else, starts a
-// test Job for each one that must be tested, and reports how each run ended.
+// takes push notifications in from Plainforge and from nobody else, starts an
+// ephemeral ko or rootless BuildKit Job for each push that must be built,
+// verifies the cosign-signed digest in Lazarette, pins app.yaml in Plainforge
+// with [skip-ci], and reports how each run ended.
 package controller
 
 import (
@@ -13,20 +15,28 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ClearedStack/keelworks/internal/buildjob"
 	"github.com/ClearedStack/keelworks/internal/caller"
 	"github.com/ClearedStack/keelworks/internal/fault"
+	"github.com/ClearedStack/keelworks/internal/lazarette"
+	"github.com/ClearedStack/keelworks/internal/plainforge"
 	"github.com/ClearedStack/keelworks/internal/push"
-	"github.com/ClearedStack/keelworks/internal/testjob"
+	"github.com/ClearedStack/keelworks/internal/registry"
 )
 
-// StateRunning is the state of a run whose Job has not ended.
+// StateRunning is the state of a run that has not finished yet.
 const StateRunning = "running"
 
-// Config is what an operator must decide. Nothing here has a guessed value.
+// Config holds the operator-supplied settings of the controller. Nothing here
+// is guessed when missing.
 type Config struct {
-	TestImage     string        // image that fetches a commit and runs its tests
-	PriorityClass string        // PriorityClass for test Jobs
-	JobTimeout    time.Duration // how long a test Job may take
+	KoImage       string        // pinned builder image for Go repositories
+	BuildKitImage string        // pinned rootless BuildKit image for Conn
+	PlainforgeURL string        // cluster-private Plainforge URL
+	ImageRegistry string        // Lazarette host:port
+	CosignSecret  string        // Secret holding cosign.key in clearedstack
+	PriorityClass string        // low PriorityClass for ephemeral build Jobs
+	JobTimeout    time.Duration // how long a build Job may take
 	ReviewTimeout time.Duration // how long the cluster may take to check a caller's token
 	MaxRuns       int           // how many runs are remembered
 }
@@ -34,8 +44,16 @@ type Config struct {
 // Validate refuses a Config with anything missing.
 func (c Config) Validate() error {
 	switch {
-	case c.TestImage == "":
-		return errors.New("no test image is configured")
+	case c.KoImage == "":
+		return errors.New("no ko builder image is configured")
+	case c.BuildKitImage == "":
+		return errors.New("no BuildKit builder image is configured")
+	case c.PlainforgeURL == "":
+		return errors.New("no Plainforge URL is configured")
+	case c.ImageRegistry == "":
+		return errors.New("no Lazarette image registry is configured")
+	case c.CosignSecret == "":
+		return errors.New("no cosign secret name is configured")
 	case c.PriorityClass == "":
 		return errors.New("no priority class is configured")
 	case c.JobTimeout < time.Second:
@@ -52,15 +70,17 @@ func (c Config) Validate() error {
 type Report struct {
 	Run        string     `json:"run"`
 	Repository string     `json:"repository"`
+	App        string     `json:"app"`
+	Builder    string     `json:"builder"`
 	Ref        string     `json:"ref"`
 	Commit     string     `json:"commit"`
 	Job        string     `json:"job"`
 	State      string     `json:"state"`
+	Digest     string     `json:"digest,omitempty"`
 	Code       fault.Code `json:"code,omitempty"`
 	Reason     string     `json:"reason,omitempty"`
 }
 
-// answer is the body of every response that is not a Report.
 type answer struct {
 	Status string     `json:"status"`
 	Run    string     `json:"run,omitempty"`
@@ -77,8 +97,10 @@ type run struct {
 // Controller implements http.Handler.
 type Controller struct {
 	cfg      Config
-	cluster  testjob.Cluster
+	cluster  buildjob.Cluster
 	reviewer caller.Reviewer
+	verifier lazarette.Verifier
+	pinner   plainforge.Pinner
 	ctx      context.Context
 	stop     context.CancelFunc
 	wg       sync.WaitGroup
@@ -88,17 +110,31 @@ type Controller struct {
 	order []string // run ids, oldest first
 }
 
-// New returns a Controller that launches Jobs on cluster and admits a push
-// notification only when reviewer says it comes from Plainforge.
-func New(cfg Config, cluster testjob.Cluster, reviewer caller.Reviewer) (*Controller, error) {
+// New returns a Controller wired to cluster, reviewer, verifier and pinner.
+func New(
+	cfg Config,
+	cluster buildjob.Cluster,
+	reviewer caller.Reviewer,
+	verifier lazarette.Verifier,
+	pinner plainforge.Pinner,
+) (*Controller, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	if cluster == nil || reviewer == nil {
-		return nil, errors.New("no cluster or no token reviewer is given")
+	if cluster == nil || reviewer == nil || verifier == nil || pinner == nil {
+		return nil, errors.New("cluster, token reviewer, Lazarette verifier and Plainforge pinner are all required")
 	}
 	ctx, stop := context.WithCancel(context.Background())
-	return &Controller{cfg: cfg, cluster: cluster, reviewer: reviewer, ctx: ctx, stop: stop, runs: map[string]*run{}}, nil
+	return &Controller{
+		cfg:      cfg,
+		cluster:  cluster,
+		reviewer: reviewer,
+		verifier: verifier,
+		pinner:   pinner,
+		ctx:      ctx,
+		stop:     stop,
+		runs:     map[string]*run{},
+	}, nil
 }
 
 // Close stops every running Job and waits for the runs to be recorded.
@@ -168,7 +204,7 @@ func (c *Controller) webhook(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var f *fault.Fault
 		if !errors.As(err, &f) {
-			f = fault.New(fault.Parse, "body could not be read") // unreachable: Decide returns only Faults
+			f = fault.New(fault.Parse, "body could not be read")
 		}
 		status := http.StatusBadRequest
 		if f.Code == fault.NeedsSubtool {
@@ -181,7 +217,7 @@ func (c *Controller) webhook(w http.ResponseWriter, r *http.Request) {
 		write(w, http.StatusOK, answer{Status: "ignored", Reason: decision.Ignore})
 		return
 	}
-	id, started, full := c.start(decision.Event)
+	id, started, full := c.start(decision)
 	switch {
 	case full:
 		w.Header().Set("Retry-After", "60")
@@ -193,17 +229,28 @@ func (c *Controller) webhook(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// start records a run for ev and launches its Job. A notification for a run
-// that is already recorded starts nothing, unless that run was interrupted:
-// SPEC.md says an interrupted build can safely be retried.
-func (c *Controller) start(ev push.Event) (id string, started, full bool) {
+func (c *Controller) builderImageFor(b registry.Builder) string {
+	if b == registry.BuilderBuildKit {
+		return c.cfg.BuildKitImage
+	}
+	return c.cfg.KoImage
+}
+
+// start records a run for d and launches its build pipeline. A notification
+// for a run that is already recorded starts nothing, unless that run was
+// interrupted: SPEC.md says an interrupted build can safely be retried.
+func (c *Controller) start(d push.Decision) (id string, started, full bool) {
+	ev := d.Event
 	id = ev.RunID()
-	spec := testjob.Spec{
+	spec := buildjob.Spec{
 		RunID:         id,
-		Repository:    ev.Repository,
+		Target:        d.Target,
 		Ref:           ev.Ref,
 		Commit:        ev.After,
-		Image:         c.cfg.TestImage,
+		BuilderImage:  c.builderImageFor(d.Target.Builder),
+		PlainforgeURL: c.cfg.PlainforgeURL,
+		ImageRegistry: c.cfg.ImageRegistry,
+		CosignSecret:  c.cfg.CosignSecret,
 		PriorityClass: c.cfg.PriorityClass,
 		Deadline:      c.cfg.JobTimeout,
 	}
@@ -214,7 +261,7 @@ func (c *Controller) start(ev push.Event) (id string, started, full bool) {
 		return id, false, true
 	}
 	if old, ok := c.runs[id]; ok {
-		if old.report.State != testjob.StateInterrupted {
+		if old.report.State != buildjob.StateInterrupted {
 			return id, false, false
 		}
 		c.forget(id)
@@ -223,8 +270,17 @@ func (c *Controller) start(ev push.Event) (id string, started, full bool) {
 		return id, false, true
 	}
 	rn := &run{
-		report: Report{Run: id, Repository: ev.Repository, Ref: ev.Ref, Commit: ev.After, Job: spec.Name(), State: StateRunning},
-		done:   make(chan struct{}),
+		report: Report{
+			Run:        id,
+			Repository: ev.Repository,
+			App:        d.Target.Slug,
+			Builder:    string(d.Target.Builder),
+			Ref:        ev.Ref,
+			Commit:     ev.After,
+			Job:        spec.Name(),
+			State:      StateRunning,
+		},
+		done: make(chan struct{}),
 	}
 	c.runs[id] = rn
 	c.order = append(c.order, id)
@@ -232,17 +288,18 @@ func (c *Controller) start(ev push.Event) (id string, started, full bool) {
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
-		result := testjob.Run(c.ctx, c.cluster, spec)
+		result := buildjob.Run(c.ctx, c.cluster, c.verifier, c.pinner, spec)
 		c.mu.Lock()
-		rn.report.State, rn.report.Code, rn.report.Reason = result.State, result.Code, result.Reason
+		rn.report.State = result.State
+		rn.report.Digest = result.Digest
+		rn.report.Code = result.Code
+		rn.report.Reason = result.Reason
 		c.mu.Unlock()
 		close(rn.done)
 	}()
 	return id, true, false
 }
 
-// evict forgets the oldest finished run. It reports false when every
-// remembered run is still running. The caller holds c.mu.
 func (c *Controller) evict() bool {
 	for _, id := range c.order {
 		if c.runs[id].report.State != StateRunning {
@@ -253,7 +310,6 @@ func (c *Controller) evict() bool {
 	return false
 }
 
-// forget removes a run. The caller holds c.mu.
 func (c *Controller) forget(id string) {
 	delete(c.runs, id)
 	for i, other := range c.order {
@@ -295,7 +351,6 @@ func allow(w http.ResponseWriter, r *http.Request, method string) bool {
 	return false
 }
 
-// write sends v as one line of JSON.
 func write(w http.ResponseWriter, status int, v any) {
 	body, err := json.Marshal(v)
 	if err != nil {

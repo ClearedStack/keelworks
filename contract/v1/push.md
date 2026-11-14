@@ -29,16 +29,16 @@ Exactly four fields, all strings. The order of the fields does not matter.
 
 | Field | Shape | Meaning |
 | --- | --- | --- |
-| `repository` | A registry slug: a lowercase letter, then lowercase letters, digits or hyphens. 32 characters at most, not ending in a hyphen. | The repository that was pushed to. |
+| `repository` | A repository name: starts with a lowercase letter, ends with a lowercase letter or digit, and contains lowercase letters, digits, hyphens and single dots between letters or digits. 32 characters at most. | The repository that was pushed to. |
 | `ref` | `refs/<kind>/<name>` in printable ASCII without spaces, 200 characters at most. | The full name of the ref that moved. |
 | `before` | 40 lowercase hexadecimal characters. | The commit the ref pointed at before the push. All zeros for a ref that did not exist. |
-| `after` | 40 lowercase hexadecimal characters. | The commit the ref points at now. This is the commit Keelworks tests. All zeros for a ref that was deleted. |
+| `after` | 40 lowercase hexadecimal characters. | The commit the ref points at now. This is the commit Keelworks builds. All zeros for a ref that was deleted. |
 
 ```json
 {"repository":"muster","ref":"refs/heads/main","before":"abababababababababababababababababababab","after":"1111111111111111111111111111111111111111"}
 ```
 
-`before` is checked for its shape and is not used for anything else today. The run is named from `repository`, `ref` and `after` alone.
+`before` is checked for its shape and is not used for anything else today. The run is named from the component's slug (`conn` for `clearedstack.com`, or `repository` otherwise) and a hash of `repository`, `ref` and `after`.
 
 ### What is not in the body
 
@@ -50,9 +50,9 @@ The rules are applied in this order, and the first one that matches decides.
 
 1. **Who is calling.** See the answers with status 401, 403 and 503 below.
 2. **Broken data: `E_PARSE`.** The body is over the limit, is not exactly one JSON object, or one of the four fields is missing, is not a string, or does not have its shape. Fields are checked in alphabetical order: all four for missing or not a string, then all four for shape.
-3. **Valid and unfamiliar: `E_NEEDS_SUBTOOL`.** In this order: the object has a fifth field; `after` is all zeros (a deleted ref); `ref` is neither `refs/heads/...` nor `refs/tags/...`.
+3. **Valid and unfamiliar: `E_NEEDS_SUBTOOL`.** In this order: the object has a fifth field; `after` is all zeros (a deleted ref); `ref` is neither `refs/heads/...` nor `refs/tags/...`; `repository` has no builder rule in Keelworks.
 4. **Ignored.** A push to a branch other than `main`.
-5. **Tested.** A push to `main`, or a push of a tag. Keelworks starts one test Job for the commit in `after`.
+5. **Built.** A push to `main`, or a push of a tag. Keelworks starts one build Job for the commit in `after`.
 
 ## The answers
 
@@ -60,7 +60,7 @@ Every answer is one line of JSON. `detail` is always one of the fixed phrases be
 
 | Status | Body | When |
 | --- | --- | --- |
-| 202 | `{"status":"accepted","run":"<run>"}` | A test Job was started. `GET /runs/<run>` reports how it ends. |
+| 202 | `{"status":"accepted","run":"<run>"}` | A build Job was started. `GET /runs/<run>` reports how it ends. |
 | 200 | `{"status":"known","run":"<run>"}` | The same `repository`, `ref` and `after` were delivered before. Nothing new is started, unless that run was interrupted; then it is started again and the answer is 202. |
 | 200 | `{"status":"ignored","reason":"branch-not-main"}` | A push to a branch other than `main`. |
 | 400 | `{"status":"refused","code":"E_PARSE","detail":"..."}` | Broken data. |
@@ -75,7 +75,7 @@ Every answer is one line of JSON. `detail` is always one of the fixed phrases be
 
 The details of `E_PARSE` are `body is too large`, `body is not valid JSON`, `body is not a JSON object`, `body could not be read`, and for each field `field <name> is missing`, `field <name> is not a string` and `field <name> is malformed`.
 
-The details of `E_NEEDS_SUBTOOL` are `notification has a field no rule covers`, `no rule for a deleted ref` and `no rule for this kind of ref`.
+The details of `E_NEEDS_SUBTOOL` are `notification has a field no rule covers`, `no rule for a deleted ref`, `no rule for this kind of ref` and `no rule for this repository`.
 
 Of the refusals, only a 503 is worth sending the same call again for. Sending a notification twice is safe: it names the same run.
 

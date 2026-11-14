@@ -2,9 +2,11 @@ package push
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/ClearedStack/keelworks/internal/fault"
+	"github.com/ClearedStack/keelworks/internal/registry"
 )
 
 const (
@@ -32,8 +34,22 @@ func TestFieldOrderDoesNotChangeTheDecision(t *testing.T) {
 		t.Fatalf("a=%+v (%v), b=%+v (%v)", a, errA, b, errB)
 	}
 	want := Event{Repository: "muster", Ref: "refs/heads/main", Before: before, After: after}
-	if a.Event != want || a.Ignore != "" {
+	if a.Event != want || a.Ignore != "" || a.Target.Builder != registry.BuilderKo {
 		t.Fatalf("decision = %+v", a)
+	}
+}
+
+func TestConnRepositoryUsesBuildKitAndSlugPrefix(t *testing.T) {
+	d, err := Decide(body("clearedstack.com", "refs/heads/main", before, after))
+	if err != nil {
+		t.Fatalf("Decide(clearedstack.com): %v", err)
+	}
+	if d.Target.Slug != "conn" || d.Target.Image != "conn" || d.Target.Builder != registry.BuilderBuildKit {
+		t.Fatalf("Target = %+v", d.Target)
+	}
+	id := d.Event.RunID()
+	if !strings.HasPrefix(id, "conn-") || strings.Contains(id, ".") {
+		t.Fatalf("RunID = %q, want conn-<hex> with no dots", id)
 	}
 }
 
@@ -80,6 +96,15 @@ func TestANewRefIsTestedAndADeletedRefIsRefused(t *testing.T) {
 	}
 }
 
+func TestUnfamiliarRepositoryIsRefusedWithNeedsSubtool(t *testing.T) {
+	for _, repo := range []string{"logbook", "unknown-tool", "a2345678901234567890123456789012"} {
+		_, err := Decide(body(repo, "refs/heads/main", before, after))
+		if code(err) != fault.NeedsSubtool {
+			t.Errorf("repository %q: err = %v, want E_NEEDS_SUBTOOL", repo, err)
+		}
+	}
+}
+
 func TestTheFormatBeforeThisOneIsRefused(t *testing.T) {
 	old := `{"repository":"muster","ref":"refs/heads/main","commit":"` + after + `","message":"Tidy the roll call"}`
 	if _, err := Decide([]byte(old)); code(err) != fault.Parse {
@@ -91,23 +116,19 @@ func TestTheFormatBeforeThisOneIsRefused(t *testing.T) {
 	}
 }
 
-func TestLongestAllowedNamesAreAccepted(t *testing.T) {
-	repo := "a2345678901234567890123456789012" // 32 characters
-	d, err := Decide(body(repo, "refs/tags/v1.0.0-rc.1", zero, after))
-	if err != nil || d.Ignore != "" {
-		t.Fatalf("d=%+v err=%v", d, err)
+func TestRepositoryAndFieldShapes(t *testing.T) {
+	long := "a2345678901234567890123456789012" // 32 characters: valid shape, unfamiliar repository
+	if _, err := Decide(body(long, "refs/tags/v1.0.0-rc.1", zero, after)); code(err) != fault.NeedsSubtool {
+		t.Fatalf("32-char repo: err = %v, want E_NEEDS_SUBTOOL", err)
 	}
-	if n := len("keelworks-test-" + d.Event.RunID()); n > 63 {
-		t.Fatalf("job name is %d characters, over the 63 a DNS label allows", n)
-	}
-	for _, bad := range []string{repo + "x", "ends-", "9lives", ""} {
-		if _, err := Decide(body(bad, "refs/heads/main", before, after)); err == nil {
-			t.Errorf("repository %q was accepted", bad)
+	for _, bad := range []string{long + "x", "ends-", "ends.", ".starts", "two..dots", "bad-.dot", "bad.-dot", "9lives", ""} {
+		if _, err := Decide(body(bad, "refs/heads/main", before, after)); code(err) != fault.Parse {
+			t.Errorf("repository %q: err = %v, want E_PARSE", bad, err)
 		}
 	}
 	for _, bad := range []string{"refs/heads/", "refs//main", "refs/heads/a b", "refs/heads", "heads/main", "refs/heads/main/"} {
-		if _, err := Decide(body("muster", bad, before, after)); err == nil {
-			t.Errorf("ref %q was accepted", bad)
+		if _, err := Decide(body("muster", bad, before, after)); code(err) != fault.Parse {
+			t.Errorf("ref %q: err = %v, want E_PARSE", bad, err)
 		}
 	}
 	for _, bad := range []string{"", "1111", after + "1", "ABABABABABABABABABABABABABABABABABABABAB", "g111111111111111111111111111111111111111"} {

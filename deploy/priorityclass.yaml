@@ -1,0 +1,14 @@
+# Ephemeral build Jobs run at low priority with preemption disabled so k3s
+# evicts them first under memory pressure while keeping Logbook, Muster,
+# Plainforge, Lazarette, Shipkeeper and the ten workers running.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: cs-build-low
+  labels:
+    app.kubernetes.io/name: keelworks
+    app.kubernetes.io/part-of: clearedstack
+value: -1000
+preemptionPolicy: Never
+globalDefault: false
+description: "Low priority for ephemeral Keelworks build Jobs."
