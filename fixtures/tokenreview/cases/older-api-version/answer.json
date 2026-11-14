@@ -1,0 +1,28 @@
+{
+  "kind": "TokenReview",
+  "apiVersion": "authentication.k8s.io/v1beta1",
+  "metadata": {
+    "creationTimestamp": null
+  },
+  "spec": {
+    "token": "made-up-token-of-plainforge",
+    "audiences": [
+      "keelworks"
+    ]
+  },
+  "status": {
+    "authenticated": true,
+    "user": {
+      "username": "system:serviceaccount:clearedstack:plainforge",
+      "uid": "made-up-uid",
+      "groups": [
+        "system:serviceaccounts",
+        "system:serviceaccounts:clearedstack",
+        "system:authenticated"
+      ]
+    },
+    "audiences": [
+      "keelworks"
+    ]
+  }
+}

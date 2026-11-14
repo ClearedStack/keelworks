@@ -1,0 +1,9 @@
+{
+  "kind": "Status",
+  "apiVersion": "v1",
+  "metadata": {},
+  "status": "Failure",
+  "message": "made-up refusal text from the cluster",
+  "reason": "Forbidden",
+  "code": 403
+}

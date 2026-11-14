@@ -1,0 +1,1 @@
+{"run":"waybill-d0586cc91203","repository":"waybill","app":"waybill","builder":"ko","ref":"refs/heads/main","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","job":"keelworks-build-waybill-d0586cc91203","state":"failed","code":"E_PARSE","reason":"manifest-pin-failed"}
