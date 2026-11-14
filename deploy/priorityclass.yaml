@@ -1,6 +1,6 @@
 # Ephemeral build Jobs run at low priority with preemption disabled so k3s
 # evicts them first under memory pressure while keeping Logbook, Muster,
-# Plainforge, Lazarette, Shipkeeper and the ten workers running.
+# Plainforge, Lazarette, Keelworks, Shipkeeper and the ten workers running.
 apiVersion: scheduling.k8s.io/v1
 kind: PriorityClass
 metadata:
@@ -12,3 +12,13 @@ value: -1000
 preemptionPolicy: Never
 globalDefault: false
 description: "Low priority for ephemeral Keelworks build Jobs."
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: clearedstack-high
+  labels:
+    app.kubernetes.io/part-of: clearedstack
+value: 100000
+globalDefault: false
+description: "High priority for ClearedStack control-plane services."

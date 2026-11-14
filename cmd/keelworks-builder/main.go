@@ -4,8 +4,10 @@
 // It reads KEELWORKS_* environment variables set by internal/buildjob, checks
 // out the exact commit from Plainforge over Git smart HTTP, runs the
 // repository's tests offline, builds and pushes the OCI image by digest to
-// Lazarette, signs the pushed digest with cosign.key as an OCI v1.1 referrer in
-// Lazarette, and writes the verified sha256 digest to /dev/termination-log.
+// Lazarette (using its built-in pure-stdlib Go OCI publisher by default for Go
+// targets, or rootless BuildKit for web targets), signs the pushed digest with
+// cosign.key as an OCI v1.1 referrer in Lazarette, and writes the verified
+// sha256 digest to /dev/termination-log.
 package main
 
 import (
@@ -50,6 +52,7 @@ type options struct {
 	npmBin          string
 	buildctlBin     string
 	checkoutTimeout time.Duration
+	publishTimeout  time.Duration
 	signTimeout     time.Duration
 }
 
@@ -71,10 +74,11 @@ func run(ctx context.Context, args []string, getenv func(string) string) error {
 	fs.StringVar(&opts.terminationLog, "termination-log", "/dev/termination-log", "path where the published sha256 digest is written")
 	fs.StringVar(&opts.lazaretteScheme, "lazarette-scheme", "http", "URL scheme for Lazarette (http or https)")
 	fs.StringVar(&opts.goBin, "go-bin", "go", "Go toolchain binary")
-	fs.StringVar(&opts.koBin, "ko-bin", "ko", "ko publisher binary")
+	fs.StringVar(&opts.koBin, "ko-bin", "", "optional external ko publisher binary; empty uses built-in Go OCI publisher")
 	fs.StringVar(&opts.npmBin, "npm-bin", "npm", "npm binary for web test suites")
 	fs.StringVar(&opts.buildctlBin, "buildctl-bin", "buildctl-daemonless.sh", "rootless BuildKit wrapper binary")
 	fs.DurationVar(&opts.checkoutTimeout, "checkout-timeout", 2*time.Minute, "how long Plainforge source checkout may take")
+	fs.DurationVar(&opts.publishTimeout, "publish-timeout", 2*time.Minute, "how long Lazarette OCI image upload may take")
 	fs.DurationVar(&opts.signTimeout, "sign-timeout", 30*time.Second, "how long Lazarette signature upload may take")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -101,6 +105,10 @@ func run(ctx context.Context, args []string, getenv func(string) string) error {
 	}
 
 	lazaretteURL := opts.lazaretteScheme + "://" + env.registryHost
+	publisher, err := lazarette.NewOCIPublisher(lazaretteURL, internalHTTP, opts.publishTimeout)
+	if err != nil {
+		return err
+	}
 	signer, err := lazarette.NewOCISigner(lazaretteURL, internalHTTP, env.privKey, opts.signTimeout)
 	if err != nil {
 		return err
@@ -121,7 +129,7 @@ func run(ctx context.Context, args []string, getenv func(string) string) error {
 	var digest string
 	switch env.target.Builder {
 	case registry.BuilderKo:
-		digest, err = buildWithKo(ctx, opts, env, srcDir)
+		digest, err = buildWithKo(ctx, opts, env, srcDir, publisher)
 	case registry.BuilderBuildKit:
 		digest, err = buildWithBuildKit(ctx, opts, env, srcDir)
 	default:
@@ -203,7 +211,7 @@ func parseJobEnv(getenv func(string) string) (jobEnv, error) {
 	}, nil
 }
 
-func buildWithKo(ctx context.Context, opts options, env jobEnv, srcDir string) (string, error) {
+func buildWithKo(ctx context.Context, opts options, env jobEnv, srcDir string, publisher *lazarette.OCIPublisher) (string, error) {
 	goCache := filepath.Join(opts.workDir, "gocache")
 	goPath := filepath.Join(opts.workDir, "gopath")
 	for _, dir := range []string{goCache, goPath, opts.tmpDir} {
@@ -230,21 +238,47 @@ func buildWithKo(ctx context.Context, opts options, env jobEnv, srcDir string) (
 		return "", errors.New("golden or unit tests failed")
 	}
 
-	mainPkg, err := resolveKoMain(srcDir, env.target.Slug)
+	mainPkg, baseImg, err := resolveKoConfig(srcDir, env.target.Slug)
 	if err != nil {
 		return "", err
 	}
-	koArgs := []string{"publish", "--bare", "--platform=linux/arm64"}
-	if opts.lazaretteScheme == "http" {
-		koArgs = append(koArgs, "--insecure-registry")
-	}
-	koArgs = append(koArgs, mainPkg)
 
-	stdout, err := runCmd(ctx, srcDir, cmdEnv, opts.koBin, koArgs...)
-	if err != nil {
-		return "", errors.New("ko publish failed")
+	if opts.koBin != "" {
+		koArgs := []string{"publish", "--bare", "--platform=linux/arm64"}
+		if opts.lazaretteScheme == "http" {
+			koArgs = append(koArgs, "--insecure-registry")
+		}
+		koArgs = append(koArgs, mainPkg)
+
+		stdout, err := runCmd(ctx, srcDir, cmdEnv, opts.koBin, koArgs...)
+		if err != nil {
+			return "", errors.New("ko publish failed")
+		}
+		return parseKoDigest(stdout, env.imageRef)
 	}
-	return parseKoDigest(stdout, env.imageRef)
+
+	binDir := filepath.Join(opts.workDir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		return "", errors.New("could not prepare binary output directory")
+	}
+	binPath := filepath.Join(binDir, env.target.Slug)
+	_ = os.Remove(binPath)
+
+	buildEnv := append(append([]string(nil), cmdEnv...), "GOOS=linux", "GOARCH=arm64")
+	if _, err := runCmd(ctx, srcDir, buildEnv, opts.goBin, "build", "-trimpath", "-ldflags=-s -w", "-o", binPath, mainPkg); err != nil {
+		return "", errors.New("go build failed")
+	}
+	binBytes, err := os.ReadFile(binPath)
+	if err != nil || len(binBytes) == 0 {
+		return "", errors.New("compiled Go binary could not be read")
+	}
+	return publisher.PublishBinary(ctx, lazarette.ImageSpec{
+		AppSlug:     env.target.Slug,
+		Binary:      binBytes,
+		TargetImage: env.target.Image,
+		BaseImage:   baseImg,
+		Arch:        "arm64",
+	})
 }
 
 func buildWithBuildKit(ctx context.Context, opts options, env jobEnv, srcDir string) (string, error) {
@@ -343,30 +377,39 @@ func runCmd(ctx context.Context, dir string, env []string, bin string, args ...s
 	return stdout.String(), nil
 }
 
-func resolveKoMain(srcDir, appSlug string) (string, error) {
+func resolveKoConfig(srcDir, appSlug string) (string, string, error) {
+	var baseImg string
 	koYAML, err := os.ReadFile(filepath.Join(srcDir, ".ko.yaml"))
 	if err == nil {
-		pkg, ok, perr := parseKoMainFromYAML(string(koYAML), appSlug)
+		pkg, base, ok, perr := parseKoConfigFromYAML(string(koYAML), appSlug)
 		if perr != nil {
-			return "", perr
+			return "", "", perr
 		}
+		baseImg = base
 		if ok {
-			return pkg, nil
+			return pkg, baseImg, nil
 		}
 	}
 	candidate := filepath.Join(srcDir, "cmd", appSlug)
 	if st, err := os.Stat(candidate); err == nil && st.IsDir() {
-		return "./cmd/" + appSlug, nil
+		return "./cmd/" + appSlug, baseImg, nil
 	}
-	return ".", nil
+	return ".", baseImg, nil
 }
 
 func parseKoMainFromYAML(text, appSlug string) (string, bool, error) {
+	pkg, _, ok, err := parseKoConfigFromYAML(text, appSlug)
+	return pkg, ok, err
+}
+
+func parseKoConfigFromYAML(text, appSlug string) (string, string, bool, error) {
 	type buildItem struct {
-		id   string
-		main string
+		id        string
+		main      string
+		baseImage string
 	}
 	var items []buildItem
+	var defaultBase string
 	inBuilds := false
 	cur := -1
 
@@ -380,6 +423,12 @@ func parseKoMainFromYAML(text, appSlug string) (string, bool, error) {
 			continue
 		}
 		if !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") {
+			if val, ok := strings.CutPrefix(trimmed, "defaultBaseImage:"); ok {
+				defaultBase = strings.Trim(strings.TrimSpace(val), `"'`)
+				inBuilds = false
+				cur = -1
+				continue
+			}
 			inBuilds = trimmed == "builds:"
 			cur = -1
 			continue
@@ -403,26 +452,32 @@ func parseKoMainFromYAML(text, appSlug string) (string, bool, error) {
 			items[cur].id = strings.Trim(strings.TrimSpace(val), `"'`)
 		} else if val, ok := strings.CutPrefix(trimmed, "main:"); ok {
 			items[cur].main = strings.Trim(strings.TrimSpace(val), `"'`)
+		} else if val, ok := strings.CutPrefix(trimmed, "baseImage:"); ok {
+			items[cur].baseImage = strings.Trim(strings.TrimSpace(val), `"'`)
 		}
 	}
 
-	chosen := ""
-	for _, it := range items {
-		if it.id == appSlug && it.main != "" {
-			chosen = it.main
+	var chosen *buildItem
+	for i := range items {
+		if items[i].id == appSlug && items[i].main != "" {
+			chosen = &items[i]
 			break
 		}
 	}
-	if chosen == "" && len(items) == 1 && items[0].main != "" && (items[0].id == "" || items[0].id == appSlug) {
-		chosen = items[0].main
+	if chosen == nil && len(items) == 1 && items[0].main != "" && (items[0].id == "" || items[0].id == appSlug) {
+		chosen = &items[0]
 	}
-	if chosen == "" {
-		return "", false, nil
+	if chosen == nil {
+		return "", defaultBase, false, nil
 	}
-	if !validMainPackage(chosen) {
-		return "", false, errors.New(".ko.yaml main package path is unsafe")
+	if !validMainPackage(chosen.main) {
+		return "", "", false, errors.New(".ko.yaml main package path is unsafe")
 	}
-	return chosen, true, nil
+	baseImg := defaultBase
+	if chosen.baseImage != "" {
+		baseImg = chosen.baseImage
+	}
+	return chosen.main, baseImg, true, nil
 }
 
 func validMainPackage(pkg string) bool {

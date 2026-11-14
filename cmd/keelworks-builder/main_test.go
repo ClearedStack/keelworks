@@ -1,12 +1,16 @@
 package main
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
+	"debug/elf"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -262,7 +266,7 @@ func TestBuilderKoEndToEndAndFailureGate(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(cloneDir, "go.mod"), []byte("module github.com/ClearedStack/muster\n\ngo 1.24\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	koYAML := "builds:\n  - id: helper\n    main: ./cmd/helper\n  - id: muster\n    main: ./cmd/muster\n"
+	koYAML := "defaultBaseImage: lazarette.clearedstack.svc.cluster.local:5000/static@sha256:" + strings.Repeat("0", 64) + "\nbuilds:\n  - id: helper\n    main: ./cmd/helper\n  - id: muster\n    main: ./cmd/muster\n"
 	if err := os.WriteFile(filepath.Join(cloneDir, ".ko.yaml"), []byte(koYAML), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -276,7 +280,7 @@ func TestBuilderKoEndToEndAndFailureGate(t *testing.T) {
 	runGit(cloneDir, "commit", "-m", "Passing service")
 	passCommit := runGit(cloneDir, "rev-parse", "HEAD")
 
-	// Second commit on another ref whose tests fail, to verify broken code never reaches ko or Lazarette.
+	// Second commit on another ref whose tests fail, to verify broken code never reaches Lazarette.
 	runGit(cloneDir, "checkout", "-b", "broken")
 	if err := os.WriteFile(filepath.Join(cloneDir, "cmd", "muster", "main_test.go"), []byte("package main\n\nimport \"testing\"\n\nfunc TestAnswer(t *testing.T) { t.Fatal(\"golden mismatch\") }\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -314,22 +318,7 @@ func TestBuilderKoEndToEndAndFailureGate(t *testing.T) {
 
 	lazURL, _ := url.Parse(lazSrv.URL)
 
-	// Fake ko binary verifies exact arguments and seeds the built image manifest in mock Lazarette.
-	fakeKo := filepath.Join(root, "fake-ko")
-	koScript := fmt.Sprintf(`#!/bin/sh
-set -eu
-case "$*" in
-  "publish --bare --platform=linux/arm64 --insecure-registry ./cmd/muster") ;;
-  *) echo "unexpected ko args: $*" >&2; exit 2 ;;
-esac
-dgst=$(python3 -c 'import urllib.request; req = urllib.request.urlopen(%q); print(req.read().decode())')
-echo "${KO_DOCKER_REPO}@${dgst}"
-`, lazSrv.URL+"/_test_ko_push")
-	if err := os.WriteFile(fakeKo, []byte(koScript), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	// 1. Failing golden test aborts before calling ko or pushing anything to Lazarette.
+	// 1. Failing golden test aborts before compiling or pushing anything to Lazarette.
 	failTerm := filepath.Join(root, "fail-termination-log")
 	failEnv := map[string]string{
 		buildjob.EnvRepository:    "muster",
@@ -347,22 +336,21 @@ echo "${KO_DOCKER_REPO}@${dgst}"
 		"-tmp-dir", filepath.Join(root, "tmp-fail"),
 		"-termination-log", failTerm,
 		"-go-bin", goBin,
-		"-ko-bin", fakeKo,
 	}, func(k string) string { return failEnv[k] })
 	if err == nil || !strings.Contains(err.Error(), "tests failed") {
 		t.Fatalf("broken test run: err=%v, want tests failed", err)
 	}
-	if koCalls.Load() != 0 || laz.manifestCount() != 0 {
-		t.Fatalf("broken build called ko (%d) or touched Lazarette (%d)", koCalls.Load(), laz.manifestCount())
+	if laz.manifestCount() != 0 {
+		t.Fatalf("broken build touched Lazarette (%d manifests)", laz.manifestCount())
 	}
 	if _, statErr := os.Stat(failTerm); !os.IsNotExist(statErr) {
 		t.Fatal("broken build wrote termination log")
 	}
 
-	// 2. Passing commit cleans work-ko/src, reuses gocache, runs go vet + go test,
-	// publishes via ko, signs in Lazarette, writes /dev/termination-log, and
-	// passes Keelworks' OCIVerifier.
-	passTerm := filepath.Join(root, "pass-termination-log")
+	// 2. Default zero-ko built-in OCI publisher: cleans work-ko/src, runs go vet +
+	// go test, compiles static linux/arm64 binary, packages /ko-app/muster into an
+	// OCI v1 image, signs it in Lazarette, writes /dev/termination-log, passes
+	// OCIVerifier, and reproduces the exact same image digest from a fresh workdir.
 	passEnv := map[string]string{
 		buildjob.EnvRepository:    "muster",
 		buildjob.EnvApp:           "muster",
@@ -373,30 +361,135 @@ echo "${KO_DOCKER_REPO}@${dgst}"
 		buildjob.EnvImage:         lazURL.Host + "/muster",
 		buildjob.EnvCosignKey:     keyFile,
 	}
-	err = run(context.Background(), []string{
+	builtinTerm1 := filepath.Join(root, "builtin-term-1")
+	if err := run(context.Background(), []string{
 		"-work-dir", sharedWork,
-		"-tmp-dir", filepath.Join(root, "tmp-pass"),
-		"-termination-log", passTerm,
+		"-tmp-dir", filepath.Join(root, "tmp-builtin-1"),
+		"-termination-log", builtinTerm1,
 		"-go-bin", goBin,
-		"-ko-bin", fakeKo,
-	}, func(k string) string { return passEnv[k] })
-	if err != nil {
-		t.Fatalf("passing ko run: %v", err)
+	}, func(k string) string { return passEnv[k] }); err != nil {
+		t.Fatalf("built-in Go OCI publish run 1: %v", err)
 	}
+	termBytes1, err := os.ReadFile(builtinTerm1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	builtinDigest1 := strings.TrimSpace(string(termBytes1))
 
-	termBytes, err := os.ReadFile(passTerm)
-	if err != nil {
-		t.Fatalf("read termination log: %v", err)
+	builtinTerm2 := filepath.Join(root, "builtin-term-2")
+	if err := run(context.Background(), []string{
+		"-work-dir", filepath.Join(root, "work-ko-clean"),
+		"-tmp-dir", filepath.Join(root, "tmp-builtin-2"),
+		"-termination-log", builtinTerm2,
+		"-go-bin", goBin,
+	}, func(k string) string { return passEnv[k] }); err != nil {
+		t.Fatalf("built-in Go OCI publish run 2: %v", err)
 	}
-	publishedDigest := strings.TrimSpace(string(termBytes))
+	termBytes2, err := os.ReadFile(builtinTerm2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if builtinDigest2 := strings.TrimSpace(string(termBytes2)); builtinDigest1 != builtinDigest2 {
+		t.Fatalf("built-in Go OCI digests differed across workdirs: %s vs %s", builtinDigest1, builtinDigest2)
+	}
 
 	noProxyHTTP := &http.Client{Transport: &http.Transport{Proxy: nil}}
 	verifier, err := lazarette.NewOCIVerifier(lazSrv.URL, noProxyHTTP, pubKey, 2*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if got := verifier.Verify(context.Background(), "muster", builtinDigest1); got != lazarette.Verified {
+		t.Fatalf("OCIVerifier after built-in Go OCI publish = %v, want Verified", got)
+	}
+
+	// Inspect the uploaded OCI image layer to confirm /ko-app/muster is a real linux/arm64 ELF binary.
+	laz.mu.Lock()
+	builtRaw := laz.manifests["muster@"+builtinDigest1].raw
+	laz.mu.Unlock()
+	var builtDoc struct {
+		Layers []struct {
+			Digest string `json:"digest"`
+		} `json:"layers"`
+	}
+	if err := json.Unmarshal(builtRaw, &builtDoc); err != nil || len(builtDoc.Layers) != 1 {
+		t.Fatalf("built manifest layers: err=%v doc=%+v", err, builtDoc)
+	}
+	laz.mu.Lock()
+	gzBytes := laz.blobs["muster@"+builtDoc.Layers[0].Digest]
+	laz.mu.Unlock()
+	zr, err := gzip.NewReader(bytes.NewReader(gzBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tarBytes, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = zr.Close()
+	tr := tar.NewReader(bytes.NewReader(tarBytes))
+	var foundELF bool
+	for {
+		hdr, terr := tr.Next()
+		if terr == io.EOF {
+			break
+		}
+		if terr != nil {
+			t.Fatal(terr)
+		}
+		if hdr.Name == "ko-app/muster" {
+			elfBytes, err := io.ReadAll(tr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ef, err := elf.NewFile(bytes.NewReader(elfBytes))
+			if err != nil {
+				t.Fatalf("ko-app/muster is not a valid ELF binary: %v", err)
+			}
+			if ef.Machine != elf.EM_AARCH64 {
+				t.Fatalf("ko-app/muster machine = %v, want EM_AARCH64", ef.Machine)
+			}
+			_ = ef.Close()
+			foundELF = true
+		}
+	}
+	if !foundELF {
+		t.Fatal("ko-app/muster missing from published OCI tar layer")
+	}
+
+	// 3. Explicit -ko-bin override remains supported when configured.
+	fakeKo := filepath.Join(root, "fake-ko")
+	koScript := fmt.Sprintf(`#!/bin/sh
+set -eu
+case "$*" in
+  "publish --bare --platform=linux/arm64 --insecure-registry ./cmd/muster") ;;
+  *) echo "unexpected ko args: $*" >&2; exit 2 ;;
+esac
+dgst=$(python3 -c 'import urllib.request; req = urllib.request.urlopen(%q); print(req.read().decode())')
+echo "${KO_DOCKER_REPO}@${dgst}"
+`, lazSrv.URL+"/_test_ko_push")
+	if err := os.WriteFile(fakeKo, []byte(koScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	passTerm := filepath.Join(root, "pass-termination-log")
+	if err := run(context.Background(), []string{
+		"-work-dir", sharedWork,
+		"-tmp-dir", filepath.Join(root, "tmp-pass"),
+		"-termination-log", passTerm,
+		"-go-bin", goBin,
+		"-ko-bin", fakeKo,
+	}, func(k string) string { return passEnv[k] }); err != nil {
+		t.Fatalf("explicit -ko-bin run: %v", err)
+	}
+	if koCalls.Load() != 1 {
+		t.Fatalf("koCalls = %d, want 1", koCalls.Load())
+	}
+	termBytes, err := os.ReadFile(passTerm)
+	if err != nil {
+		t.Fatalf("read termination log: %v", err)
+	}
+	publishedDigest := strings.TrimSpace(string(termBytes))
 	if got := verifier.Verify(context.Background(), "muster", publishedDigest); got != lazarette.Verified {
-		t.Fatalf("OCIVerifier after builder run = %v, want Verified", got)
+		t.Fatalf("OCIVerifier after explicit -ko-bin run = %v, want Verified", got)
 	}
 }
 
