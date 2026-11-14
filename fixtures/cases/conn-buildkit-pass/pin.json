@@ -1,0 +1,6 @@
+{
+  "repository": "clearedstack.com",
+  "app": "conn",
+  "digest": "sha256:edad8a9655ae56e76bb857dac10fd494aa3fcdff0b0ec5f82b5210df8981d62e",
+  "message": "pin conn to sha256:edad8a9655ae56e76bb857dac10fd494aa3fcdff0b0ec5f82b5210df8981d62e [skip-ci]"
+}

@@ -4,7 +4,14 @@
     {"repository": "muster", "commit": "2222222222222222222222222222222222222222", "outcome": "fail"},
     {"repository": "lazarette", "commit": "3333333333333333333333333333333333333333", "outcome": "pass"},
     {"repository": "shipkeeper", "commit": "4444444444444444444444444444444444444444", "outcome": "stall"},
-    {"repository": "plainforge", "commit": "5555555555555555555555555555555555555555", "outcome": "preempt"}
+    {"repository": "plainforge", "commit": "5555555555555555555555555555555555555555", "outcome": "preempt"},
+    {"repository": "clearedstack.com", "commit": "7777777777777777777777777777777777777777", "outcome": "pass"},
+    {"repository": "assay", "commit": "8888888888888888888888888888888888888888", "outcome": "sign-fail"},
+    {"repository": "sextant", "commit": "9999999999999999999999999999999999999999", "outcome": "unsigned"},
+    {"repository": "waybill", "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "outcome": "pass"}
+  ],
+  "manifests": [
+    {"repository": "waybill", "appYAML": "name: waybill\nimage: waybill\n"}
   ],
   "callers": [
     {"token": "made-up-token-of-plainforge", "username": "system:serviceaccount:clearedstack:plainforge", "audiences": ["keelworks"]},

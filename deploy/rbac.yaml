@@ -1,0 +1,73 @@
+# Least-privilege identity for Keelworks in the clearedstack namespace:
+# - create TokenReviews to authenticate incoming Plainforge webhooks;
+# - create, inspect and delete ephemeral build Jobs (and read pod termination
+#   status) inside clearedstack only.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: keelworks
+  namespace: clearedstack
+  labels:
+    app.kubernetes.io/name: keelworks
+    app.kubernetes.io/part-of: clearedstack
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: keelworks-jobs
+  namespace: clearedstack
+  labels:
+    app.kubernetes.io/name: keelworks
+    app.kubernetes.io/part-of: clearedstack
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: keelworks-jobs
+  namespace: clearedstack
+  labels:
+    app.kubernetes.io/name: keelworks
+    app.kubernetes.io/part-of: clearedstack
+subjects:
+  - kind: ServiceAccount
+    name: keelworks
+    namespace: clearedstack
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: keelworks-jobs
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: keelworks-tokenreview
+  labels:
+    app.kubernetes.io/name: keelworks
+    app.kubernetes.io/part-of: clearedstack
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: keelworks-tokenreview
+  labels:
+    app.kubernetes.io/name: keelworks
+    app.kubernetes.io/part-of: clearedstack
+subjects:
+  - kind: ServiceAccount
+    name: keelworks
+    namespace: clearedstack
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: keelworks-tokenreview

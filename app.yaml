@@ -1,0 +1,12 @@
+# Desired state of Keelworks for Shipkeeper reconciliation.
+# The bootstrap digest is replaced when Keelworks builds and signs its image
+# into Lazarette.
+name: keelworks
+namespace: clearedstack
+image: keelworks
+digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+replicas: 1
+port: 8080
+memory: 32Mi
+allowFrom:
+  - clearedstack/plainforge

@@ -1,0 +1,117 @@
+# Default deny in clearedstack, plus the exact openings Keelworks and its
+# ephemeral build Jobs need. Neither Keelworks nor its build Jobs may reach
+# Logbook, Muster, cs-workers or the public internet.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: clearedstack
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# Keelworks controller:
+# - Ingress: webhooks from Plainforge on TCP 8080 only.
+# - Egress: cluster DNS, Plainforge (TCP 8080 for app.yaml commits), Lazarette
+#   (TCP 5000 for cosign signature verification), and the Kubernetes API server
+#   (TCP 443 and 6443 for TokenReview and batch/v1 Jobs).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: keelworks
+  namespace: clearedstack
+  labels:
+    app.kubernetes.io/name: keelworks
+    app.kubernetes.io/part-of: clearedstack
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: keelworks
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: plainforge
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: plainforge
+      ports:
+        - protocol: TCP
+          port: 8080
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: lazarette
+      ports:
+        - protocol: TCP
+          port: 5000
+    - ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
+---
+# Ephemeral ko and rootless BuildKit Jobs spawned by Keelworks:
+# - Ingress: none.
+# - Egress: cluster DNS, Plainforge (TCP 8080 to fetch the commit under test),
+#   and Lazarette (TCP 5000 to pull the pinned base image and push the signed
+#   result). No Kubernetes API access and no external internet access.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: keelworks-build
+  namespace: clearedstack
+  labels:
+    app.kubernetes.io/name: keelworks
+    app.kubernetes.io/part-of: clearedstack
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: keelworks-build
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: plainforge
+      ports:
+        - protocol: TCP
+          port: 8080
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: lazarette
+      ports:
+        - protocol: TCP
+          port: 5000

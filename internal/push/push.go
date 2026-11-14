@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/ClearedStack/keelworks/internal/fault"
+	"github.com/ClearedStack/keelworks/internal/registry"
 )
 
 // MaxBody is the largest notification body Keelworks reads, in bytes.
@@ -28,22 +29,27 @@ type Event struct {
 	Repository string
 	Ref        string
 	Before     string // the commit the ref pointed at before the push
-	After      string // the commit the ref points at now; the one that is tested
+	After      string // the commit the ref points at now; the one that is built
 }
 
 // Decision says what to do with a valid notification. Ignore is empty when
-// the push must be tested, and holds the reason otherwise.
+// the push must be built, and holds the reason otherwise.
 type Decision struct {
 	Event  Event
+	Target registry.Target
 	Ignore string
 }
 
-// RunID names the run for this event. It depends only on the repository,
-// the ref and the commit that is tested, so a notification delivered twice
-// names one run.
+// RunID names the run for this event. It uses the component's DNS-safe slug
+// as the prefix and depends only on the repository, the ref and the commit
+// that is built, so a notification delivered twice names one run.
 func (e Event) RunID() string {
+	prefix := e.Repository
+	if t, ok := registry.ByRepository(e.Repository); ok {
+		prefix = t.Slug
+	}
 	sum := sha256.Sum256([]byte(e.Repository + "\x00" + e.Ref + "\x00" + e.After))
-	return e.Repository + "-" + hex.EncodeToString(sum[:6])
+	return prefix + "-" + hex.EncodeToString(sum[:6])
 }
 
 // fields are the notification's field names, in the order they are checked.
@@ -107,12 +113,16 @@ func Decide(body []byte) (Decision, error) {
 	if !isBranch && !isTag {
 		return Decision{}, fault.New(fault.NeedsSubtool, "no rule for this kind of ref")
 	}
-
-	// Valid and familiar: test it or ignore it.
-	if isBranch && branch != "main" {
-		return Decision{Event: ev, Ignore: ReasonBranchNotMain}, nil
+	target, ok := registry.ByRepository(ev.Repository)
+	if !ok {
+		return Decision{}, fault.New(fault.NeedsSubtool, "no rule for this repository")
 	}
-	return Decision{Event: ev}, nil
+
+	// Valid and familiar: build it or ignore it.
+	if isBranch && branch != "main" {
+		return Decision{Event: ev, Target: target, Ignore: ReasonBranchNotMain}, nil
+	}
+	return Decision{Event: ev, Target: target}, nil
 }
 
 // object decodes body as exactly one JSON object.
@@ -135,15 +145,26 @@ func object(body []byte) (map[string]json.RawMessage, error) {
 	return raw, nil
 }
 
-// validRepository accepts a registry slug: a lowercase letter, then lowercase
-// letters, digits or hyphens, 32 characters at most, not ending in a hyphen.
+func isLowerAlnum(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+}
+
+// validRepository accepts a repository name: starts with a lowercase letter,
+// ends with a lowercase letter or digit, up to 32 characters, made of
+// lowercase letters, digits, hyphens and single dots between letters or digits.
 func validRepository(s string) bool {
-	if len(s) == 0 || len(s) > 32 || s[0] < 'a' || s[0] > 'z' || s[len(s)-1] == '-' {
+	if len(s) == 0 || len(s) > 32 || s[0] < 'a' || s[0] > 'z' || !isLowerAlnum(s[len(s)-1]) {
 		return false
 	}
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
+		switch {
+		case isLowerAlnum(c) || c == '-':
+		case c == '.':
+			if !isLowerAlnum(s[i-1]) || !isLowerAlnum(s[i+1]) {
+				return false
+			}
+		default:
 			return false
 		}
 	}

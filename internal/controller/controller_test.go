@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/ClearedStack/keelworks/internal/buildjob"
+	"github.com/ClearedStack/keelworks/internal/plainforge"
 	"github.com/ClearedStack/keelworks/internal/push"
 	"github.com/ClearedStack/keelworks/internal/standin"
-	"github.com/ClearedStack/keelworks/internal/testjob"
 )
 
 const (
@@ -20,22 +22,34 @@ const (
 )
 
 type fixture struct {
-	ctl      *Controller
-	cluster  *standin.Cluster
-	reviewer *standin.Reviewer
-	forge    standin.Plainforge
+	ctl        *Controller
+	cluster    *standin.Cluster
+	reviewer   *standin.Reviewer
+	lazarette  *standin.Lazarette
+	forgeStore *standin.ForgeStore
+	forge      standin.Plainforge
 }
 
 func setup(t *testing.T, cfg Config) fixture {
 	t.Helper()
-	cluster := standin.NewCluster(script(t))
-	reviewer := standin.NewReviewer(script(t))
-	ctl, err := New(cfg, cluster, reviewer)
+	sc := script(t)
+	laz := standin.NewLazarette()
+	cluster := standin.NewCluster(sc, laz)
+	reviewer := standin.NewReviewer(sc)
+	forgeStore := standin.NewForgeStore(sc)
+	ctl, err := New(cfg, cluster, reviewer, laz, forgeStore)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(ctl.Close)
-	return fixture{ctl, cluster, reviewer, standin.Plainforge{Keelworks: ctl, Token: plainforgeToken}}
+	return fixture{
+		ctl:        ctl,
+		cluster:    cluster,
+		reviewer:   reviewer,
+		lazarette:  laz,
+		forgeStore: forgeStore,
+		forge:      standin.Plainforge{Keelworks: ctl, Token: plainforgeToken},
+	}
 }
 
 func wait(t *testing.T, ctl *Controller, id string) Report {
@@ -51,6 +65,27 @@ func wait(t *testing.T, ctl *Controller, id string) Report {
 
 func runID(repository, ref, after string) string {
 	return push.Event{Repository: repository, Ref: ref, After: after}.RunID()
+}
+
+func TestPassingBuildVerifiesAndPinsWithSkipCI(t *testing.T) {
+	f := setup(t, testConfig())
+	id := runID("muster", "refs/heads/main", passing)
+	status, _ := f.forge.Push("muster", "refs/heads/main", earlier, passing)
+	if status != http.StatusAccepted {
+		t.Fatalf("status %d, want 202", status)
+	}
+	r := wait(t, f.ctl, id)
+	if r.State != buildjob.StatePassed || r.Digest == "" {
+		t.Fatalf("report %+v", r)
+	}
+	commits := f.forgeStore.Commits()
+	if len(commits) != 1 || !strings.Contains(commits[0].Message, plainforge.SkipMarker) {
+		t.Fatalf("commits = %+v", commits)
+	}
+	manifest, ok := f.forgeStore.Manifest("muster")
+	if !ok || !strings.Contains(string(manifest), "digest: "+r.Digest+"\n") {
+		t.Fatalf("app.yaml after pin:\n%s", manifest)
+	}
 }
 
 func TestSecondDeliveryStartsNothing(t *testing.T) {
@@ -80,7 +115,7 @@ func TestInterruptedRunIsRetriedOnRedelivery(t *testing.T) {
 		if status != http.StatusAccepted {
 			t.Fatalf("delivery %d: status %d, want 202", i, status)
 		}
-		if r := wait(t, f.ctl, id); r.State != testjob.StateInterrupted || r.Reason != testjob.ReasonPreempted {
+		if r := wait(t, f.ctl, id); r.State != buildjob.StateInterrupted || r.Reason != buildjob.ReasonPreempted {
 			t.Fatalf("delivery %d: report %+v", i, r)
 		}
 	}
@@ -116,8 +151,6 @@ func TestTheCommitBeforeDoesNotChangeTheRun(t *testing.T) {
 	}
 }
 
-// TestCallerIsCheckedBeforeAnythingElse sends bodies that would be refused
-// for their own sake and expects the answer about the caller instead.
 func TestCallerIsCheckedBeforeAnythingElse(t *testing.T) {
 	f := setup(t, testConfig())
 	for _, body := range []string{"", "{", `{"repository":"muster"}`} {
@@ -201,7 +234,6 @@ func TestTableFullRefusesAndFinishedRunsMakeRoom(t *testing.T) {
 		t.Fatalf("status %d, body %s", status, body)
 	}
 
-	// A second controller whose only run has finished gives its place away.
 	g := setup(t, cfg)
 	first := runID("muster", "refs/heads/main", passing)
 	g.forge.Push("muster", "refs/heads/main", earlier, passing)
@@ -222,7 +254,7 @@ func TestCloseInterruptsARunningJobAndLeavesNoneBehind(t *testing.T) {
 		t.Fatalf("state %q, want running", r.State)
 	}
 	f.ctl.Close()
-	if r, _ := f.ctl.Report(id); r.State != testjob.StateInterrupted || r.Reason != testjob.ReasonShutdown {
+	if r, _ := f.ctl.Report(id); r.State != buildjob.StateInterrupted || r.Reason != buildjob.ReasonShutdown {
 		t.Fatalf("report %+v", r)
 	}
 	if n := f.cluster.Live(); n != 0 {
@@ -258,20 +290,39 @@ func TestOtherPathsAndMethods(t *testing.T) {
 
 func TestConfigWithAnythingMissingIsRefused(t *testing.T) {
 	broken := []func(*Config){
-		func(c *Config) { c.TestImage = "" },
+		func(c *Config) { c.KoImage = "" },
+		func(c *Config) { c.BuildKitImage = "" },
+		func(c *Config) { c.PlainforgeURL = "" },
+		func(c *Config) { c.ImageRegistry = "" },
+		func(c *Config) { c.CosignSecret = "" },
 		func(c *Config) { c.PriorityClass = "" },
 		func(c *Config) { c.JobTimeout = 0 },
 		func(c *Config) { c.ReviewTimeout = 0 },
 		func(c *Config) { c.MaxRuns = 0 },
 	}
+	sc := standin.Script{}
 	for i, breakIt := range broken {
 		cfg := testConfig()
 		breakIt(&cfg)
-		if _, err := New(cfg, standin.NewCluster(standin.Script{}), standin.NewReviewer(standin.Script{})); err == nil {
+		laz := standin.NewLazarette()
+		if _, err := New(cfg, standin.NewCluster(sc, laz), standin.NewReviewer(sc), laz, standin.NewForgeStore(sc)); err == nil {
 			t.Errorf("case %d: a broken configuration was accepted", i)
 		}
 	}
-	if _, err := New(testConfig(), standin.NewCluster(standin.Script{}), nil); err == nil {
+	laz := standin.NewLazarette()
+	cl := standin.NewCluster(sc, laz)
+	rev := standin.NewReviewer(sc)
+	pin := standin.NewForgeStore(sc)
+	if _, err := New(testConfig(), nil, rev, laz, pin); err == nil {
+		t.Error("a controller without a cluster was accepted")
+	}
+	if _, err := New(testConfig(), cl, nil, laz, pin); err == nil {
 		t.Error("a controller without a token reviewer was accepted")
+	}
+	if _, err := New(testConfig(), cl, rev, nil, pin); err == nil {
+		t.Error("a controller without a Lazarette verifier was accepted")
+	}
+	if _, err := New(testConfig(), cl, rev, laz, nil); err == nil {
+		t.Error("a controller without a Plainforge pinner was accepted")
 	}
 }

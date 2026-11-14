@@ -1,0 +1,30 @@
+# Build configuration for ko. Keelworks is built straight from source into a
+# minimal non-root image; there is no Dockerfile.
+#
+# Inside the cluster, ko pulls its static base image from Lazarette by digest so
+# nothing is fetched from outside at runtime. Populate Lazarette with the
+# signed static non-root base image during cluster bootstrap and replace the
+# bootstrap digest below.
+defaultBaseImage: lazarette.clearedstack.svc.cluster.local:5000/static@sha256:0000000000000000000000000000000000000000000000000000000000000000
+defaultPlatforms:
+  - linux/arm64
+
+builds:
+  - id: keelworks
+    main: ./cmd/keelworks
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s
+      - -w
+  - id: keelworks-builder
+    main: ./cmd/keelworks-builder
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s
+      - -w

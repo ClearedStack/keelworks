@@ -1,0 +1,113 @@
+# Keelworks controller in the clearedstack namespace.
+#
+# All three container images (keelworks, keelworks-ko and keelworks-buildkit)
+# come from Lazarette inside the cluster and are pinned by sha256 digest;
+# nothing is pulled from outside at runtime. Replace the zeroed bootstrap
+# digests with the digests recorded when cluster bootstrap populates Lazarette.
+#
+# The Secret keelworks-cosign (keys cosign.key and cosign.pub) is generated
+# inside the cluster during bootstrap and is never stored in Git. Only
+# cosign.pub is mounted into this controller pod; cosign.key is mounted
+# read-only only into short-lived build Jobs.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keelworks
+  namespace: clearedstack
+  labels:
+    app.kubernetes.io/name: keelworks
+    app.kubernetes.io/part-of: clearedstack
+    app.kubernetes.io/version: v0.1.0-draft
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: keelworks
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: keelworks
+        app.kubernetes.io/part-of: clearedstack
+    spec:
+      serviceAccountName: keelworks
+      automountServiceAccountToken: true
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: ["arm64"]
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values: ["cm3588-plus"]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: keelworks
+          image: lazarette.clearedstack.svc.cluster.local:5000/keelworks@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          args:
+            - -addr=:8080
+            - -ko-image=lazarette.clearedstack.svc.cluster.local:5000/keelworks-ko@sha256:0000000000000000000000000000000000000000000000000000000000000000
+            - -buildkit-image=lazarette.clearedstack.svc.cluster.local:5000/keelworks-buildkit@sha256:0000000000000000000000000000000000000000000000000000000000000000
+            - -plainforge-url=http://plainforge.clearedstack.svc.cluster.local:8080
+            - -lazarette-url=http://lazarette.clearedstack.svc.cluster.local:5000
+            - -image-registry=lazarette.clearedstack.svc.cluster.local:5000
+            - -cosign-secret=keelworks-cosign
+            - -cosign-pub-file=/var/run/secrets/keelworks/cosign/cosign.pub
+            - -priority-class=cs-build-low
+            - -job-timeout=10m
+            - -token-review-timeout=5s
+          env:
+            - name: GOMEMLIMIT
+              value: 26MiB
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 200m
+              memory: 32Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: cosign-public
+              mountPath: /var/run/secrets/keelworks/cosign
+              readOnly: true
+      volumes:
+        - name: cosign-public
+          secret:
+            secretName: keelworks-cosign
+            items:
+              - key: cosign.pub
+                path: cosign.pub

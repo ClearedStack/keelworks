@@ -1,0 +1,6 @@
+{
+  "repository": "muster",
+  "app": "muster",
+  "digest": "sha256:859af7250e48e1564aacc860c3a17f2911c883ea6a9c72047231962c1c9eade5",
+  "message": "pin muster to sha256:859af7250e48e1564aacc860c3a17f2911c883ea6a9c72047231962c1c9eade5 [skip-ci]"
+}
